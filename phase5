@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+"""
+Phase 5: Find optimal K using OCSVM with fixed default hyperparameters.
+Evaluates with Leave-One-User-Out on the 13 dev users.
+"""
+
+import os, glob, warnings
+import pandas as pd
+import numpy as np
+from sklearn.svm import OneClassSVM
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import accuracy_score
+
+warnings.filterwarnings('ignore')
+
+DATA_DIR = './features'
+CONSENSUS_FILE = 'consensus_ranking.csv'
+N_DEV_USERS = 13
+K_VALUES = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 120, 150]
+FAR_LIMIT = 0.005
+
+# ------------------------------------------------------------------
+# 1. Load data for all dev users (similar to earlier scripts)
+# ------------------------------------------------------------------
+train_files = sorted(glob.glob(os.path.join(DATA_DIR, '*_training_sessions.csv')))
+dev_users = [os.path.basename(f).replace('_training_sessions.csv', '') for f in train_files[:N_DEV_USERS]]
+
+def load_user(user):
+    train = pd.read_csv(os.path.join(DATA_DIR, f'{user}_training_sessions.csv'))
+    test = pd.read_csv(os.path.join(DATA_DIR, f'{user}_test_sessions.csv'))
+    train.drop(columns=['user'], errors='ignore', inplace=True)
+    test.drop(columns=['user'], errors='ignore', inplace=True)
+    y_test = test['label'].astype(int)
+    test.drop(columns=['label'], inplace=True)
+    train = train.select_dtypes(include=[np.number]).fillna(0)
+    test = test.select_dtypes(include=[np.number]).fillna(0)
+    return train, test, y_test
+
+# ------------------------------------------------------------------
+# 2. Pre-load all dev users
+# ------------------------------------------------------------------
+user_data = {}
+all_columns = None
+for user in dev_users:
+    train, test, y_test = load_user(user)
+    if all_columns is None:
+        all_columns = train.columns.tolist()
+    else:
+        assert train.columns.tolist() == all_columns, f"Column mismatch for {user}"
+    user_data[user] = {'train': train, 'test': test, 'y_test': y_test}
+
+# ------------------------------------------------------------------
+# 3. Load consensus ranking
+# ------------------------------------------------------------------
+consensus = pd.read_csv(CONSENSUS_FILE)  # columns: feature, avg_percentile
+ranked_features = consensus['feature'].tolist()
+feature_to_idx = {name: i for i, name in enumerate(all_columns)}
+
+# ------------------------------------------------------------------
+# 4. Evaluate each K
+# ------------------------------------------------------------------
+results = []
+for k in K_VALUES:
+    # Select top-k features
+    selected = [f for f in ranked_features[:k] if f in feature_to_idx]
+    k_eff = len(selected)
+    if k_eff == 0:
+        continue
+    idxs = [feature_to_idx[f] for f in selected]
+    
+    accs, frrs, fars = [], [], []
+    for user in dev_users:
+        train = user_data[user]['train'].iloc[:, idxs].values.astype(float)
+        test  = user_data[user]['test'].iloc[:, idxs].values.astype(float)
+        y_true = user_data[user]['y_test']
+        
+        scaler = StandardScaler()
+        train_scaled = scaler.fit_transform(train)
+        test_scaled = scaler.transform(test)
+        
+        # Fixed hyperparameters as per agreement
+        ocsvm = OneClassSVM(kernel='rbf', nu=0.1, gamma=1.0/k_eff)
+        ocsvm.fit(train_scaled)
+        scores = ocsvm.decision_function(test_scaled)
+        pred = (scores > 0).astype(int)   # 1=genuine
+        
+        genuine = y_true == 0
+        impostor = y_true == 1
+        frr = 1 - pred[genuine].mean() if genuine.sum()>0 else 0
+        far = pred[impostor].mean() if impostor.sum()>0 else 0
+        # accuracy mapping: pred 1 should match label 0 -> invert for sklearn
+        acc = accuracy_score(1 - y_true, pred)
+        accs.append(acc); frrs.append(frr); fars.append(far)
+    
+    avg_acc = np.mean(accs)
+    avg_frr = np.mean(frrs)
+    avg_far = np.mean(fars)
+    results.append((k, k_eff, avg_acc, avg_frr, avg_far))
+    print(f"K={k:3d} (eff={k_eff:3d})  ACC={avg_acc:.4f}  FRR={avg_frr:.4f}  FAR={avg_far:.4f}")
+
+# ------------------------------------------------------------------
+# 5. Choose best K (highest accuracy while FAR <= limit)
+# ------------------------------------------------------------------
+best = None
+for r in results:
+    if r[4] <= FAR_LIMIT:  # avg_far
+        if best is None or r[2] > best[2]:  # higher acc
+            best = r
+if best is None:
+    print("No K meets FAR limit, picking one with lowest FAR...")
+    best = min(results, key=lambda x: x[4])  # min FAR
+
+print(f"\nBest K = {best[0]}  (effective features = {best[1]})")
+print(f"  Dev Accuracy = {best[2]:.4f}, Dev FRR = {best[3]:.4f}, Dev FAR = {best[4]:.4f}")
+# Save the chosen feature list
+final_features = ranked_features[:best[1]]
+pd.Series(final_features).to_csv('final_feature_set.csv', index=False, header=['feature'])
+print("Final feature set saved to final_feature_set.csv")
