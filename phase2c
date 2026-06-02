@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+"""
+Phase 2C: Random Forest importance ranking using Leave-One-User-Out (LOUO).
+For each dev user, train RF on other dev users' genuine (train) + impostor (test) data,
+collect importance, and average across all dev users.
+"""
+
+import os, glob, warnings
+import pandas as pd
+import numpy as np
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import StandardScaler
+
+warnings.filterwarnings('ignore')
+
+DATA_DIR = './features'
+DEV_USERS_FILE = 'dev_users.txt'   # optional file listing dev users (one per line)
+N_DEV_USERS = 13
+RANK_OUTPUT = 'rf_louo_importance.csv'
+
+# ------------------------------------------------------------------
+# 1. Identify dev users
+# ------------------------------------------------------------------
+train_files = sorted(glob.glob(os.path.join(DATA_DIR, '*_training_sessions.csv')))
+all_users = [os.path.basename(f).replace('_training_sessions.csv', '') for f in train_files]
+dev_users = all_users[:N_DEV_USERS]
+print(f"Dev users: {dev_users}")
+
+# ------------------------------------------------------------------
+# 2. Load data for a user (training and test)
+# ------------------------------------------------------------------
+def load_user(user):
+    train = pd.read_csv(os.path.join(DATA_DIR, f'{user}_training_sessions.csv'))
+    test = pd.read_csv(os.path.join(DATA_DIR, f'{user}_test_sessions.csv'))
+    # Remove non-feature columns
+    train.drop(columns=['user'], errors='ignore', inplace=True)
+    test.drop(columns=['user'], errors='ignore', inplace=True)
+    # Extract labels from test (assume column 'label', 0=genuine, 1=impostor)
+    y_test = test['label'].astype(int)
+    test.drop(columns=['label'], inplace=True)
+    # Keep only numeric and fill missing
+    train = train.select_dtypes(include=[np.number]).fillna(0)
+    test = test.select_dtypes(include=[np.number]).fillna(0)
+    return train, test, y_test
+
+# ------------------------------------------------------------------
+# 3. LOUO loop
+# ------------------------------------------------------------------
+feature_names = None
+importances_sum = None
+count = 0
+
+for target_user in dev_users:
+    # Build development set from other users
+    X_list, y_list = [], []
+    for other_user in dev_users:
+        if other_user == target_user:
+            continue
+        train_other, test_other, y_test_other = load_user(other_user)
+        # Genuine from training (label 0)
+        X_list.append(train_other.values)
+        y_list.append(np.zeros(len(train_other)))
+        # Impostor from test (label 1)
+        impostor_mask = y_test_other == 1
+        if impostor_mask.sum() > 0:
+            X_list.append(test_other.values[impostor_mask])
+            y_list.append(np.ones(impostor_mask.sum()))
+    if not X_list:
+        continue
+    X_dev = np.vstack(X_list)
+    y_dev = np.hstack(y_list)
+    
+    if feature_names is None:
+        # Use columns from the first training dataframe (all should be same)
+        train_ref, _, _ = load_user(dev_users[0])
+        feature_names = train_ref.columns.tolist()
+    
+    # Standardize
+    scaler = StandardScaler()
+    X_dev_scaled = scaler.fit_transform(X_dev)
+    
+    # Train RF
+    rf = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
+    rf.fit(X_dev_scaled, y_dev)
+    
+    if importances_sum is None:
+        importances_sum = rf.feature_importances_.copy()
+    else:
+        importances_sum += rf.feature_importances_
+    count += 1
+
+# Average importances
+avg_importances = importances_sum / count
+importance_df = pd.DataFrame({'feature': feature_names, 'importance': avg_importances})
+importance_df.sort_values('importance', ascending=False, inplace=True)
+importance_df.to_csv(RANK_OUTPUT, index=False)
+print(f"Saved RF LOUO importance to {RANK_OUTPUT}")
