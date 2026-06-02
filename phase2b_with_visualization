@@ -1,0 +1,217 @@
+#!/usr/bin/env python3
+"""
+Phase 2B – Fisher Score feature ranking with full visualisation (13 dev users).
+Input:
+  - ./features/*_training_sessions.csv (first 13 dev users)
+  - cleaned_features.csv (from Phase 1)
+Output:
+  - fisher_ranking.csv
+  - Multiple plots (as before)
+"""
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from pathlib import Path
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
+import warnings
+
+warnings.filterwarnings('ignore')
+sns.set_style("whitegrid")
+plt.rcParams['figure.dpi'] = 100
+
+# ============================================================
+# 0. COLOR UTILITIES
+# ============================================================
+def generate_unique_colors(n_colors):
+    if n_colors <= 10:
+        return plt.cm.tab10(range(n_colors))
+    elif n_colors <= 20:
+        colors1 = plt.cm.tab10(range(10))
+        colors2 = plt.cm.tab20(range(10, 20))
+        return np.vstack([colors1, colors2])[:n_colors]
+    else:
+        return plt.cm.hsv(np.linspace(0, 1, n_colors))
+
+# ============================================================
+# 1. DATA LOADING (MODIFIED)
+# ============================================================
+def load_all_user_data(base_path='./features', user_list=None):
+    """Load CSV files for the specified user list only."""
+    data = []
+    users = []
+    if user_list is None:
+        # fallback to all files
+        user_list = [csv_file.stem.replace('_training_sessions', '')
+                     for csv_file in Path(base_path).glob('*_training_sessions.csv')]
+
+    for username in user_list:
+        csv_file = Path(base_path) / f'{username}_training_sessions.csv'
+        if not csv_file.exists():
+            print(f"Warning: {csv_file} not found")
+            continue
+        try:
+            df = pd.read_csv(csv_file)
+            df['user'] = username
+            data.append(df)
+            users.append(username)
+            print(f"Loaded {username}: {len(df)} samples")
+        except Exception as e:
+            print(f"Error loading {csv_file}: {e}")
+            continue
+
+    if not data:
+        raise FileNotFoundError("No CSV files found for the given user list!")
+
+    combined_df = pd.concat(data, ignore_index=True)
+    print(f"\nTotal: {len(combined_df)} samples from {len(users)} users")
+    return combined_df, users
+
+
+def get_numeric_features(df):
+    potential_features = [col for col in df.columns if col != 'user']
+    numeric_features = []
+    for col in potential_features:
+        try:
+            pd.to_numeric(df[col], errors='raise')
+            numeric_features.append(col)
+        except (ValueError, TypeError):
+            print(f"Skipping non-numeric column: {col} (dtype: {df[col].dtype})")
+            continue
+    print(f"\nFound {len(numeric_features)} numeric features out of {len(potential_features)} total columns")
+    return numeric_features
+
+# ============================================================
+# 2. FEATURE SCORING (unchanged)
+# ============================================================
+def calculate_fisher_score(df, feature_cols):
+    scores = {}
+    for feature in feature_cols:
+        try:
+            feature_data = pd.to_numeric(df[feature], errors='coerce')
+            if feature_data.isna().all():
+                print(f"Warning: Feature '{feature}' contains no valid numeric data")
+                continue
+            temp_df = pd.DataFrame({'feature': feature_data, 'user': df['user']}).dropna()
+            if temp_df.empty:
+                continue
+            overall_mean = temp_df['feature'].mean()
+            user_means = temp_df.groupby('user')['feature'].mean()
+            user_counts = temp_df.groupby('user')['feature'].count()
+            between_var = np.sum(user_counts * (user_means - overall_mean) ** 2) / len(temp_df)
+            within_var = temp_df.groupby('user')['feature'].var().mean()
+            if pd.isna(within_var) or within_var == 0:
+                within_var = 1e-10
+            fisher_score = between_var / (within_var + 1e-10)
+            user_stds = temp_df.groupby('user')['feature'].std()
+            user_means_for_cv = temp_df.groupby('user')['feature'].mean()
+            cv_values = user_stds / (user_means_for_cv + 1e-10)
+            cv_mean = cv_values.mean()
+            scores[feature] = {
+                'fisher_score': fisher_score,
+                'between_var': between_var,
+                'within_var': within_var,
+                'cv_mean': cv_mean,
+                'valid_samples': len(temp_df)
+            }
+        except Exception as e:
+            print(f"Error processing feature '{feature}': {e}")
+            continue
+    if not scores:
+        raise ValueError("No valid features found for analysis!")
+    return pd.DataFrame(scores).T.sort_values('fisher_score', ascending=False)
+
+# ============================================================
+# 3. VISUALIZATIONS (unchanged, except they use df with cleaned features)
+# ============================================================
+# [All the existing visualization functions: visualize_top_features,
+#  plot_feature_heatmap, plot_cv_comparison, plot_feature_pairs,
+#  plot_dimensionality_reduction, plot_fisher_score_ranking]
+# (These remain identical to your original code; they are not repeated for brevity,
+# but you should copy them from your existing script.)
+
+# ============================================================
+# 4. REPORTING (unchanged)
+# ============================================================
+def generate_feature_report(df, feature_scores, top_n=10):
+    # ... (same as original)
+    pass   # include the full function from your original code
+
+# ============================================================
+# 5. MAIN EXECUTION (MODIFIED)
+# ============================================================
+def main():
+    print("\n" + "=" * 70)
+    print(" " * 15 + "FEATURE ANALYSIS & VISUALIZATION (13 DEV USERS)")
+    print("=" * 70 + "\n")
+
+    try:
+        # --- Determine dev users ---
+        base_path = './features'
+        all_train_files = sorted(Path(base_path).glob('*_training_sessions.csv'))
+        all_users = [f.stem.replace('_training_sessions', '') for f in all_train_files]
+        N_DEV = 13
+        if len(all_users) < N_DEV:
+            raise ValueError(f"Only {len(all_users)} users available, need {N_DEV}")
+        dev_users = all_users[:N_DEV]
+        print(f"Development users: {dev_users}")
+
+        # --- Load cleaned feature list ---
+        cleaned_df = pd.read_csv('cleaned_features.csv')
+        cleaned_features = cleaned_df['feature'].tolist()
+
+        # --- Load data (only dev users) ---
+        df, users = load_all_user_data(base_path, user_list=dev_users)
+
+        # --- Filter to cleaned features ---
+        available_cleaned = [f for f in cleaned_features if f in df.columns]
+        df = df[available_cleaned + ['user']]
+        print(f"Using {len(available_cleaned)} cleaned features.")
+
+        # --- Rest of the pipeline exactly as before ---
+        feature_cols = get_numeric_features(df)
+        if not feature_cols:
+            print("ERROR: No numeric features found!")
+            return
+
+        feature_scores = calculate_fisher_score(df, feature_cols)
+        print(f"✓ Calculated Fisher scores for {len(feature_scores)} features")
+
+        generate_feature_report(df, feature_scores, top_n=10)
+
+        # Visualizations
+        print("\n[1/6] Fisher Score Ranking...")
+        plot_fisher_score_ranking(feature_scores, top_n=min(20, len(feature_scores)))
+        print("\n[2/6] Top Features Box Plots...")
+        visualize_top_features(df, feature_scores, top_n=min(5, len(feature_scores)))
+        print("\n[3/6] Feature Heatmap...")
+        plot_feature_heatmap(df, feature_scores, top_n=min(10, len(feature_scores)))
+        print("\n[4/6] Coefficient of Variation...")
+        plot_cv_comparison(df, feature_scores, top_n=min(10, len(feature_scores)))
+        print("\n[5/6] Feature Pair Scatter Plots...")
+        plot_feature_pairs(df, feature_scores, n_pairs=min(3, len(feature_scores) // 2))
+        print("\n[6/6] Dimensionality Reduction...")
+        plot_dimensionality_reduction(df, feature_scores, top_n=min(10, len(feature_scores)))
+
+        # Save final ranking CSV (fisher_ranking.csv)
+        fisher_ranking = feature_scores[['fisher_score']].reset_index()
+        fisher_ranking.columns = ['feature', 'fisher_score']
+        fisher_ranking.to_csv('fisher_ranking.csv', index=False)
+        print("\n✓ fisher_ranking.csv saved.")
+
+        print("\n" + "=" * 70)
+        print(" " * 25 + "ANALYSIS COMPLETE!")
+        print("=" * 70)
+
+    except Exception as e:
+        print(f"\nERROR: {e}")
+        print("\nPlease check:")
+        print("1. CSV files exist in './features' directory")
+        print("2. cleaned_features.csv is present")
+        print("3. File permissions are correct")
+
+if __name__ == "__main__":
+    main()
