@@ -1,14 +1,10 @@
 #!/usr/bin/env python3
 """
-Phase 3: Weighted Consensus Ranking
-- Reads the three independent ranking files.
-- Converts each method's scores to percentile ranks (0‑1).
-- Applies a weighted average:
-      Boruta+SHAP: 50%
-      RF LOUO:     35%
-      Fisher:      15%
-- Imputes missing percentiles with 0.5 (neutral).
-- Saves full details: all percentile columns, weighted average, and stability std.
+Phase 3 – Weighted Consensus Ranking (refined).
+Reads the three ranking files (Boruta+SHAP, Fisher, RF LOUO),
+converts scores to percentile ranks,
+applies weighted averaging,
+and saves a full master list with stability scores.
 """
 
 import pandas as pd
@@ -16,64 +12,67 @@ import numpy as np
 
 # ======================= CONFIGURATION =======================
 FILES = {
-    'boruta_shap': 'boruta_shap_ranking.csv',
-    'fisher': 'fisher_ranking.csv',
-    'rf_louo': 'rf_louo_importance.csv'
+    'boruta_shap': 'boruta_shap_ranking.csv',   # column: shap_importance
+    'fisher':      'fisher_ranking.csv',         # column: fisher_score
+    'rf_louo':     'rf_louo_importance.csv'      # column: importance
 }
 
 # Weights (must sum to 1)
 WEIGHTS = {
     'boruta_shap': 0.50,
-    'fisher': 0.15,
-    'rf_louo': 0.35
+    'fisher':      0.15,
+    'rf_louo':     0.35
 }
 
-MISSING_FILL = 0.5          # neutral percentile for missing features
-OUTPUT = 'consensus_ranking.csv'
+OUTPUT_MASTER = 'consensus_ranking.csv'
 # =============================================================
 
-# 1. Load each ranking, compute percentile ranks ---------------------------------
+# 1. Load and normalize each ranking ------------------------------------------
 ranks = []
 for method, path in FILES.items():
     df = pd.read_csv(path)
-    # Determine the score column
+
+    # Identify the score column
     if 'shap_importance' in df.columns:
         score_col = 'shap_importance'
     elif 'fisher_score' in df.columns:
         score_col = 'fisher_score'
     else:
-        score_col = 'importance'   # RF LOUO
+        score_col = 'importance'   # default for RF
 
-    # Percentile rank (0‑1), higher score -> higher percentile
+    # Percentile rank (0‑1), higher score → higher percentile
     df['percentile'] = df[score_col].rank(pct=True)
     df = df[['feature', 'percentile']].rename(columns={'percentile': f'pct_{method}'})
     ranks.append(df)
 
-# 2. Merge on feature (outer join to keep all features from any method) ----------
+# 2. Merge all rankings on feature (outer join) ---------------------------------
 consensus = ranks[0]
 for df in ranks[1:]:
     consensus = consensus.merge(df, on='feature', how='outer')
 
-# 3. Impute missing percentiles with 0.5 (neutral) instead of 0 -----------------
-pct_cols = [f'pct_{method}' for method in WEIGHTS.keys()]   # order: boruta_shap, fisher, rf_louo
-consensus[pct_cols] = consensus[pct_cols].fillna(MISSING_FILL)
+# 3. Fill missing percentile values with 0.5 (neutral) ------------------------
+pct_cols = [c for c in consensus.columns if c.startswith('pct_')]
+consensus[pct_cols] = consensus[pct_cols].fillna(0.5)
 
-# 4. Weighted average -----------------------------------------------------------
-consensus['avg_percentile'] = (
-      WEIGHTS['boruta_shap'] * consensus['pct_boruta_shap']
-    + WEIGHTS['fisher']      * consensus['pct_fisher']
-    + WEIGHTS['rf_louo']     * consensus['pct_rf_louo']
-)
+# 4. Calculate weighted average percentile ------------------------------------
+# Ensure weights are applied in the correct order
+weights_ordered = [WEIGHTS.get(col.replace('pct_', ''), 0) for col in pct_cols]
+# Normalize in case the dictionary doesn't cover all (but it should)
+weights_ordered = np.array(weights_ordered) / np.sum(weights_ordered)
+consensus['avg_percentile'] = consensus[pct_cols].values.dot(weights_ordered)
 
-# 5. Stability standard deviation (how much the percentiles differ across methods)
+# 5. Stability score (standard deviation of the percentile ranks) -------------
 consensus['std_percentile'] = consensus[pct_cols].std(axis=1)
 
-# 6. Sort by weighted average descending, then reset index -----------------------
+# 6. Sort and save full master list --------------------------------------------
 consensus.sort_values('avg_percentile', ascending=False, inplace=True)
 consensus.reset_index(drop=True, inplace=True)
 
-# 7. Save the full table ---------------------------------------------------------
-consensus.to_csv(OUTPUT, index=False)
-print(f"Consensus ranking saved to {OUTPUT}")
-print("\nTop 10 features:")
-print(consensus[['feature', 'avg_percentile', 'std_percentile']].head(10))
+# Save all columns
+consensus.to_csv(OUTPUT_MASTER, index=False)
+
+# Print summary
+print(f"Consensus ranking saved to {OUTPUT_MASTER}")
+print("\nTop 15 features (with stability):")
+print(consensus[['feature', 'avg_percentile', 'std_percentile']].head(15))
+print(f"\nTotal features in consensus: {len(consensus)}")
