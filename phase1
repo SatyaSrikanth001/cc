@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 """
-Phase 1: Data cleansing and pre-filtering.
-Reads all training CSVs from the 13 development users (or all if you want),
-removes zero/near-zero variance features, drops or imputes missing columns,
-and eliminates highly correlated features.
-Output: cleaned_features.csv (list of surviving features)
+Phase 1 – Refined Data Cleansing & Pre‑Filtering.
+- Loads the 13 development users' training CSVs.
+- Removes duplicate columns.
+- Drops features with >60% missing values.
+- Median‑imputes remaining missing values.
+- Drops near‑zero variance features (var < 1e-8).
+- Drops one of each pair of highly correlated features (Spearman |ρ| > 0.95).
+Outputs:
+  cleaned_features.csv (final list of surviving features)
+  removed_missing.csv
+  removed_low_variance.csv
+  removed_correlation.csv
 """
 
 import os, glob, warnings
@@ -18,12 +25,13 @@ PATTERN = '*_training_sessions.csv'
 N_DEV_USERS = 13
 
 # Parameters
-VARIANCE_THRESHOLD = 1e-8          # near-zero variance
+VARIANCE_THRESHOLD = 1e-8          # near‑zero variance
 MISSING_THRESHOLD = 0.6            # drop features missing in >60% of rows
 CORRELATION_THRESHOLD = 0.95       # absolute correlation
+CORR_METHOD = 'spearman'           # robust to outliers & monotonic relations
 
 # ------------------------------------------------------------------
-# 1. Load dev users training data
+# 1. Load dev users training data (only the 13 development users)
 # ------------------------------------------------------------------
 files = sorted(glob.glob(os.path.join(DATA_DIR, PATTERN)))[:N_DEV_USERS]
 dfs = []
@@ -39,47 +47,83 @@ print(f"Combined shape: {combined.shape}")
 combined = combined.select_dtypes(include=[np.number])
 
 # ------------------------------------------------------------------
-# 2. Handle missing values (drop columns with too many NaNs)
+# 2. Remove duplicate columns (exact copies)
+# ------------------------------------------------------------------
+duplicate_mask = combined.T.duplicated(keep='first')
+duplicate_features = combined.columns[duplicate_mask].tolist()
+if duplicate_features:
+    combined = combined.loc[:, ~duplicate_mask]
+    print(f"Dropped {len(duplicate_features)} duplicate columns.")
+    # Log them for audit
+    pd.Series(duplicate_features).to_csv('removed_duplicates.csv', index=False, header=['feature'])
+else:
+    print("No duplicate columns found.")
+
+# ------------------------------------------------------------------
+# 3. Drop features with excessive missing values
 # ------------------------------------------------------------------
 missing_ratio = combined.isna().mean()
 cols_to_drop_missing = missing_ratio[missing_ratio > MISSING_THRESHOLD].index.tolist()
 combined.drop(columns=cols_to_drop_missing, inplace=True, errors='ignore')
-print(f"Dropped {len(cols_to_drop_missing)} columns with >{MISSING_THRESHOLD*100}% missing.")
+print(f"Dropped {len(cols_to_drop_missing)} columns with >{MISSING_THRESHOLD*100:.0f}% missing.")
 
-# Fill remaining NaNs with 0 (simple; you can improve later)
-combined.fillna(0, inplace=True)
+# Save list of removed (missing) features
+pd.Series(cols_to_drop_missing).to_csv('removed_missing.csv', index=False, header=['feature'])
 
 # ------------------------------------------------------------------
-# 3. Remove zero/near-zero variance features
+# 4. Impute remaining missing values with the median (preserves distribution)
+# ------------------------------------------------------------------
+# compute medians on the combined data, then fill
+combined = combined.fillna(combined.median())
+print("Imputed remaining missing values with column medians.")
+
+# ------------------------------------------------------------------
+# 5. Remove zero / near‑zero variance features
 # ------------------------------------------------------------------
 variances = combined.var()
 low_var_cols = variances[variances < VARIANCE_THRESHOLD].index.tolist()
-combined.drop(columns=low_var_cols, inplace=True)
-print(f"Dropped {len(low_var_cols)} near-zero variance features.")
+combined.drop(columns=low_var_cols, inplace=True, errors='ignore')
+print(f"Dropped {len(low_var_cols)} near‑zero variance features.")
+
+# Save list of removed low‑variance features
+pd.Series(low_var_cols).to_csv('removed_low_variance.csv', index=False, header=['feature'])
 
 # ------------------------------------------------------------------
-# 4. Remove highly correlated features (keep the one with higher variance)
+# 6. Remove highly correlated features (keep the one with higher variance)
 # ------------------------------------------------------------------
-corr_matrix = combined.corr().abs()
+# Use specified correlation method (default Spearman)
+corr_matrix = combined.corr(method=CORR_METHOD).abs()
+# Keep only upper triangle to avoid duplicate pairs
 upper_tri = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
 
 to_drop = set()
 for col in upper_tri.columns:
     high_corr = upper_tri[col][upper_tri[col] > CORRELATION_THRESHOLD].index.tolist()
-    if high_corr:
-        # For each pair, drop the one with lower variance
-        for other in high_corr:
-            if combined[col].var() < combined[other].var():
-                to_drop.add(col)
-            else:
-                to_drop.add(other)
+    if not high_corr:
+        continue
+    for other in high_corr:
+        # Drop the feature with lower variance
+        if combined[col].var() < combined[other].var():
+            to_drop.add(col)
+        else:
+            to_drop.add(other)
 
 combined.drop(columns=list(to_drop), inplace=True, errors='ignore')
-print(f"Dropped {len(to_drop)} features due to high correlation.")
+print(f"Dropped {len(to_drop)} features due to high correlation (|ρ| > {CORRELATION_THRESHOLD}).")
 
+# Save list of removed correlated features
+pd.Series(list(to_drop)).to_csv('removed_correlation.csv', index=False, header=['feature'])
+
+# ------------------------------------------------------------------
+# 7. Save final surviving feature list
+# ------------------------------------------------------------------
 surviving_features = combined.columns.tolist()
 print(f"Surviving features after cleansing: {len(surviving_features)}")
-
-# Save list for later use
 pd.Series(surviving_features).to_csv('cleaned_features.csv', index=False, header=['feature'])
-print("Saved cleaned_features.csv")
+print("Saved cleaned_features.csv\n")
+
+# Print some statistics
+print("=== Summary of removed features ===")
+print(f"Missing (> {MISSING_THRESHOLD*100:.0f}%): {len(cols_to_drop_missing)}")
+print(f"Low variance (< {VARIANCE_THRESHOLD}): {len(low_var_cols)}")
+print(f"High correlation (> {CORRELATION_THRESHOLD}): {len(to_drop)}")
