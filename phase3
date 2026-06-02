@@ -1,0 +1,53 @@
+#!/usr/bin/env python3
+"""
+Phase 3: Consensus ranking via percentile averaging.
+Reads the three ranking files, converts scores to percentiles,
+averages them, and saves the final master list.
+"""
+
+import pandas as pd
+import numpy as np
+
+# File paths (adjust if needed)
+FILES = {
+    'boruta_shap': 'boruta_shap_ranking.csv',
+    'fisher': 'fisher_ranking.csv',
+    'rf_louo': 'rf_louo_importance.csv'
+}
+
+# Load and normalize each ranking
+ranks = []
+for method, path in FILES.items():
+    df = pd.read_csv(path)
+    # Ensure columns are correctly named
+    if 'shap_importance' in df.columns:
+        score_col = 'shap_importance'
+    elif 'fisher_score' in df.columns:
+        score_col = 'fisher_score'
+    else:
+        score_col = 'importance'  # default from RF
+    # Percentile rank (0-1)
+    df['percentile'] = df[score_col].rank(pct=True)  # higher score -> higher percentile
+    df = df[['feature', 'percentile']].rename(columns={'percentile': f'pct_{method}'})
+    ranks.append(df)
+
+# Merge on feature
+consensus = ranks[0]
+for df in ranks[1:]:
+    consensus = consensus.merge(df, on='feature', how='outer')
+
+# Fill missing (some features may not be present in all methods) with 0 percentile
+consensus.fillna(0, inplace=True)
+
+# Average the percentile columns
+pct_cols = [c for c in consensus.columns if c.startswith('pct_')]
+consensus['avg_percentile'] = consensus[pct_cols].mean(axis=1)
+
+# Sort descending
+consensus.sort_values('avg_percentile', ascending=False, inplace=True)
+consensus.reset_index(drop=True, inplace=True)
+
+# Save final master list
+consensus[['feature', 'avg_percentile']].to_csv('consensus_ranking.csv', index=False)
+print(f"Consensus ranking saved to consensus_ranking.csv. Top 10 features:")
+print(consensus[['feature', 'avg_percentile']].head(10))
