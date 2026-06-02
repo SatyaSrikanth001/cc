@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-Phase 2B – Fisher Score feature ranking with full visualisation (13 dev users).
-Input:
-  - ./features/*_training_sessions.csv (first 13 dev users)
-  - cleaned_features.csv (from Phase 1)
-Output:
-  - fisher_ranking.csv
-  - Multiple plots (as before)
+Phase 2B – Fisher Score feature ranking (13 dev users, cleaned features).
+- Loads 13 development users only.
+- Filters to cleaned features from Phase 1.
+- Imputes remaining missing values with median.
+- Saves: fisher_ranking.csv (feature, fisher_score, between_var, within_var, cv_mean)
+- Generates all visualisation plots.
 """
 
 import pandas as pd
@@ -27,6 +26,7 @@ plt.rcParams['figure.dpi'] = 100
 # 0. COLOR UTILITIES
 # ============================================================
 def generate_unique_colors(n_colors):
+    """Generate n_colors unique colors for visualization"""
     if n_colors <= 10:
         return plt.cm.tab10(range(n_colors))
     elif n_colors <= 20:
@@ -44,7 +44,6 @@ def load_all_user_data(base_path='./features', user_list=None):
     data = []
     users = []
     if user_list is None:
-        # fallback to all files
         user_list = [csv_file.stem.replace('_training_sessions', '')
                      for csv_file in Path(base_path).glob('*_training_sessions.csv')]
 
@@ -72,6 +71,7 @@ def load_all_user_data(base_path='./features', user_list=None):
 
 
 def get_numeric_features(df):
+    """Extract only numeric feature columns (excludes 'user')."""
     potential_features = [col for col in df.columns if col != 'user']
     numeric_features = []
     for col in potential_features:
@@ -85,9 +85,14 @@ def get_numeric_features(df):
     return numeric_features
 
 # ============================================================
-# 2. FEATURE SCORING (unchanged)
+# 2. FEATURE SCORING (unchanged, but called after NaN imputation)
 # ============================================================
 def calculate_fisher_score(df, feature_cols):
+    """
+    Calculate Fisher Score for each feature.
+    Fisher Score = Between-class variance / Within-class variance
+    Higher is better for user discrimination.
+    """
     scores = {}
     for feature in feature_cols:
         try:
@@ -125,23 +130,284 @@ def calculate_fisher_score(df, feature_cols):
     return pd.DataFrame(scores).T.sort_values('fisher_score', ascending=False)
 
 # ============================================================
-# 3. VISUALIZATIONS (unchanged, except they use df with cleaned features)
+# 3. VISUALIZATIONS (full implementations)
 # ============================================================
-# [All the existing visualization functions: visualize_top_features,
-#  plot_feature_heatmap, plot_cv_comparison, plot_feature_pairs,
-#  plot_dimensionality_reduction, plot_fisher_score_ranking]
-# (These remain identical to your original code; they are not repeated for brevity,
-# but you should copy them from your existing script.)
+def visualize_top_features(df, feature_scores, top_n=5):
+    """Box plots of the top N features."""
+    available_features = min(top_n, len(feature_scores))
+    top_features = feature_scores.head(available_features).index.tolist()
+    if not top_features:
+        print("No features available for visualization")
+        return
+
+    fig, axes = plt.subplots(available_features, 1, figsize=(12, 4 * available_features))
+    if available_features == 1:
+        axes = [axes]
+
+    for idx, feature in enumerate(top_features):
+        try:
+            feature_data = pd.to_numeric(df[feature], errors='coerce')
+            plot_df = pd.DataFrame({'user': df['user'], 'value': feature_data}).dropna()
+            sns.boxplot(data=plot_df, x='user', y='value', ax=axes[idx], palette='Set2')
+            axes[idx].set_title(f'{feature} | Fisher Score: {feature_scores.loc[feature, "fisher_score"]:.2f}',
+                                fontsize=12, fontweight='bold')
+            axes[idx].tick_params(axis='x', rotation=45)
+            axes[idx].set_xlabel('User', fontsize=10)
+            axes[idx].set_ylabel('Value', fontsize=10)
+        except Exception as e:
+            print(f"Error plotting feature '{feature}': {e}")
+            continue
+
+    plt.tight_layout()
+    plt.savefig('top_features_boxplots.png', dpi=300, bbox_inches='tight')
+    print("✓ Saved: top_features_boxplots.png")
+    plt.show()
+
+
+def plot_feature_heatmap(df, feature_scores, top_n=10):
+    """Heatmap of mean values per user."""
+    available_features = min(top_n, len(feature_scores))
+    top_features = feature_scores.head(available_features).index.tolist()
+    if not top_features:
+        print("No features available for heatmap")
+        return
+
+    try:
+        clean_data = {}
+        for feature in top_features:
+            clean_data[feature] = pd.to_numeric(df[feature], errors='coerce')
+        clean_df = pd.DataFrame(clean_data)
+        clean_df['user'] = df['user']
+        clean_df = clean_df.dropna()
+        mean_values = clean_df.groupby('user')[top_features].mean()
+
+        plt.figure(figsize=(12, 8))
+        sns.heatmap(mean_values.T, annot=True, fmt='.2f', cmap='YlOrRd',
+                    cbar_kws={'label': 'Mean Value'}, linewidths=0.5)
+        plt.title('Mean Feature Values per User (Top Features)', fontsize=14, fontweight='bold')
+        plt.xlabel('User', fontsize=12)
+        plt.ylabel('Feature', fontsize=12)
+        plt.tight_layout()
+        plt.savefig('feature_heatmap.png', dpi=300, bbox_inches='tight')
+        print("✓ Saved: feature_heatmap.png")
+        plt.show()
+    except Exception as e:
+        print(f"Error creating heatmap: {e}")
+
+
+def plot_cv_comparison(df, feature_scores, top_n=10):
+    """Coefficient of Variation comparison (lower = more consistent within user)."""
+    available_features = min(top_n, len(feature_scores))
+    top_features = feature_scores.head(available_features).index.tolist()
+    if not top_features:
+        print("No features available for CV comparison")
+        return
+
+    try:
+        fig, ax = plt.subplots(figsize=(14, 6))
+        cv_data = []
+        for feature in top_features:
+            feature_data = pd.to_numeric(df[feature], errors='coerce')
+            temp_df = pd.DataFrame({'user': df['user'], 'value': feature_data}).dropna()
+            for user in temp_df['user'].unique():
+                user_data = temp_df[temp_df['user'] == user]['value']
+                if len(user_data) > 1:
+                    cv = user_data.std() / (user_data.mean() + 1e-10)
+                    cv_data.append({'Feature': feature, 'User': user, 'CV': cv})
+
+        if cv_data:
+            cv_df = pd.DataFrame(cv_data)
+            sns.boxplot(data=cv_df, x='Feature', y='CV', ax=ax, palette='Set3')
+            ax.set_title('Coefficient of Variation by Feature (Lower = More Consistent Within User)',
+                         fontsize=14, fontweight='bold')
+            ax.set_xlabel('Feature', fontsize=12)
+            ax.set_ylabel('CV', fontsize=12)
+            ax.tick_params(axis='x', rotation=45)
+            plt.tight_layout()
+            plt.savefig('cv_comparison.png', dpi=300, bbox_inches='tight')
+            print("✓ Saved: cv_comparison.png")
+            plt.show()
+        else:
+            print("No valid CV data found")
+    except Exception as e:
+        print(f"Error creating CV comparison: {e}")
+
+
+def plot_feature_pairs(df, feature_scores, n_pairs=3):
+    """Scatter plots of top feature pairs."""
+    available_pairs = min(n_pairs, len(feature_scores) // 2)
+    if available_pairs == 0:
+        print("Not enough features for pair plots")
+        return
+
+    top_features = feature_scores.head(available_pairs * 2).index.tolist()
+    fig, axes = plt.subplots(1, available_pairs, figsize=(6 * available_pairs, 5))
+    if available_pairs == 1:
+        axes = [axes]
+
+    unique_users = df['user'].unique()
+    colors = generate_unique_colors(len(unique_users))
+
+    for idx in range(available_pairs):
+        try:
+            feat_x = top_features[idx * 2] if idx * 2 < len(top_features) else top_features[-2]
+            feat_y = top_features[idx * 2 + 1] if idx * 2 + 1 < len(top_features) else top_features[-1]
+            x_data = pd.to_numeric(df[feat_x], errors='coerce')
+            y_data = pd.to_numeric(df[feat_y], errors='coerce')
+            plot_df = pd.DataFrame({'x': x_data, 'y': y_data, 'user': df['user']}).dropna()
+
+            for user_idx, user in enumerate(unique_users):
+                if user in plot_df['user'].values:
+                    user_data = plot_df[plot_df['user'] == user]
+                    axes[idx].scatter(user_data['x'], user_data['y'],
+                                      label=user, alpha=0.7,
+                                      color=colors[user_idx], s=40)
+            axes[idx].set_xlabel(feat_x, fontsize=10)
+            axes[idx].set_ylabel(feat_y, fontsize=10)
+            axes[idx].set_title(f'{feat_x} vs {feat_y}', fontsize=11, fontweight='bold')
+            axes[idx].legend(fontsize=7, ncol=2, loc='best')
+            axes[idx].grid(alpha=0.3)
+        except Exception as e:
+            print(f"Error creating pair plot {idx}: {e}")
+            continue
+
+    plt.tight_layout()
+    plt.savefig('feature_pairs_scatter.png', dpi=300, bbox_inches='tight')
+    print("✓ Saved: feature_pairs_scatter.png")
+    plt.show()
+
+
+def plot_dimensionality_reduction(df, feature_scores, top_n=10):
+    """Visualize users in reduced feature space (PCA + t-SNE)."""
+    available_features = min(top_n, len(feature_scores))
+    top_features = feature_scores.head(available_features).index.tolist()
+    if len(top_features) < 2:
+        print("Need at least 2 features for dimensionality reduction")
+        return
+
+    try:
+        clean_data = {}
+        for feature in top_features:
+            clean_data[feature] = pd.to_numeric(df[feature], errors='coerce')
+        clean_df = pd.DataFrame(clean_data)
+        clean_df['user'] = df['user']
+        clean_df = clean_df.dropna()
+
+        if len(clean_df) < 5:
+            print("Not enough clean samples for dimensionality reduction")
+            return
+
+        X = clean_df[top_features].values
+        y = clean_df['user'].values
+
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X)
+
+        fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+        unique_users = np.unique(y)
+        colors = generate_unique_colors(len(unique_users))
+
+        # PCA
+        pca = PCA(n_components=2)
+        X_pca = pca.fit_transform(X_scaled)
+        for user_idx, user in enumerate(unique_users):
+            mask = y == user
+            axes[0].scatter(X_pca[mask, 0], X_pca[mask, 1],
+                            label=user, alpha=0.7, s=60, color=colors[user_idx])
+        axes[0].set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.1%})', fontsize=12)
+        axes[0].set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.1%})', fontsize=12)
+        axes[0].set_title('PCA Projection (Top Features)', fontsize=14, fontweight='bold')
+        axes[0].legend(fontsize=8, ncol=2, loc='best')
+        axes[0].grid(alpha=0.3)
+
+        # t-SNE
+        if len(clean_df) >= 5:
+            perplexity = min(30, max(2, len(clean_df) // 5))
+            tsne = TSNE(n_components=2, random_state=42, perplexity=perplexity, init='pca')
+            X_tsne = tsne.fit_transform(X_scaled)
+            for user_idx, user in enumerate(unique_users):
+                mask = y == user
+                axes[1].scatter(X_tsne[mask, 0], X_tsne[mask, 1],
+                                label=user, alpha=0.7, s=60, color=colors[user_idx])
+            axes[1].set_xlabel('t-SNE 1', fontsize=12)
+            axes[1].set_ylabel('t-SNE 2', fontsize=12)
+            axes[1].set_title('t-SNE Projection (Top Features)', fontsize=14, fontweight='bold')
+            axes[1].legend(fontsize=8, ncol=2, loc='best')
+            axes[1].grid(alpha=0.3)
+        else:
+            axes[1].text(0.5, 0.5, 'Not enough samples\nfor t-SNE', ha='center', va='center',
+                         transform=axes[1].transAxes)
+            axes[1].set_title('t-SNE (Insufficient Data)', fontsize=14)
+
+        plt.tight_layout()
+        plt.savefig('dimensionality_reduction.png', dpi=300, bbox_inches='tight')
+        print("✓ Saved: dimensionality_reduction.png")
+        plt.show()
+
+    except Exception as e:
+        print(f"Error in dimensionality reduction: {e}")
+
+
+def plot_fisher_score_ranking(feature_scores, top_n=20):
+    """Horizontal bar chart of Fisher scores."""
+    available_features = min(top_n, len(feature_scores))
+    top_features = feature_scores.head(available_features)
+    if top_features.empty:
+        print("No features available for ranking plot")
+        return
+
+    plt.figure(figsize=(12, 8))
+    plt.barh(range(len(top_features)), top_features['fisher_score'], color='steelblue')
+    plt.yticks(range(len(top_features)), top_features.index)
+    plt.xlabel('Fisher Score', fontsize=12)
+    plt.ylabel('Feature', fontsize=12)
+    plt.title(f'Top {available_features} Features by Fisher Score', fontsize=14, fontweight='bold')
+    plt.gca().invert_yaxis()
+    plt.grid(axis='x', alpha=0.3)
+    plt.tight_layout()
+    plt.savefig('fisher_score_ranking.png', dpi=300, bbox_inches='tight')
+    print("✓ Saved: fisher_score_ranking.png")
+    plt.show()
+
 
 # ============================================================
-# 4. REPORTING (unchanged)
+# 4. REPORTING
 # ============================================================
 def generate_feature_report(df, feature_scores, top_n=10):
-    # ... (same as original)
-    pass   # include the full function from your original code
+    """Generate a comprehensive report."""
+    available_features = min(top_n, len(feature_scores))
+    top_features = feature_scores.head(available_features)
+
+    print("\n" + "=" * 70)
+    print(" " * 20 + "FEATURE QUALITY REPORT")
+    print("=" * 70)
+    print(f"\nDataset Summary:")
+    print(f"  • Total Users:    {df['user'].nunique()}")
+    print(f"  • Total Samples:  {len(df)}")
+    print(f"  • Valid Features: {len(feature_scores)}")
+    print(f"  • Samples/User:   {df.groupby('user').size().to_dict()}")
+    print(f"\n\nTop {available_features} Features by Fisher Score:")
+    print("-" * 70)
+
+    for idx, (feature, row) in enumerate(top_features.iterrows(), 1):
+        print(f"\n{idx}. {feature}")
+        print(f"   Fisher Score:  {row['fisher_score']:>10.4f} (higher = better)")
+        print(f"   Between Var:   {row['between_var']:>10.4f} (inter-user variance)")
+        print(f"   Within Var:    {row['within_var']:>10.4f} (intra-user variance)")
+        print(f"   Avg CV:        {row['cv_mean']:>10.4f} (lower = more consistent)")
+        print(f"   Valid Samples: {int(row['valid_samples']):>10d} (after cleaning)")
+
+    # Export to CSV with all columns
+    fisher_ranking = feature_scores[['fisher_score', 'between_var', 'within_var', 'cv_mean']].reset_index()
+    fisher_ranking.columns = ['feature', 'fisher_score', 'between_var', 'within_var', 'cv_mean']
+    fisher_ranking.to_csv('fisher_ranking.csv', index=False)
+    print("\n" + "=" * 70)
+    print("✓ Full ranking saved to 'fisher_ranking.csv'")
+    print("=" * 70 + "\n")
+
 
 # ============================================================
-# 5. MAIN EXECUTION (MODIFIED)
+# 5. MAIN EXECUTION
 # ============================================================
 def main():
     print("\n" + "=" * 70)
@@ -149,7 +415,7 @@ def main():
     print("=" * 70 + "\n")
 
     try:
-        # --- Determine dev users ---
+        # Determine dev users
         base_path = './features'
         all_train_files = sorted(Path(base_path).glob('*_training_sessions.csv'))
         all_users = [f.stem.replace('_training_sessions', '') for f in all_train_files]
@@ -159,19 +425,24 @@ def main():
         dev_users = all_users[:N_DEV]
         print(f"Development users: {dev_users}")
 
-        # --- Load cleaned feature list ---
+        # Load cleaned feature list
         cleaned_df = pd.read_csv('cleaned_features.csv')
         cleaned_features = cleaned_df['feature'].tolist()
 
-        # --- Load data (only dev users) ---
+        # Load data (only dev users)
         df, users = load_all_user_data(base_path, user_list=dev_users)
 
-        # --- Filter to cleaned features ---
+        # Filter to cleaned features
         available_cleaned = [f for f in cleaned_features if f in df.columns]
         df = df[available_cleaned + ['user']]
         print(f"Using {len(available_cleaned)} cleaned features.")
 
-        # --- Rest of the pipeline exactly as before ---
+        # ---------- NEW: Impute remaining NaNs with median ----------
+        numeric_cols = [c for c in df.columns if c != 'user']
+        df[numeric_cols] = df[numeric_cols].fillna(df[numeric_cols].median())
+        print("Filled remaining NaN values with column medians.")
+
+        # Continue with pipeline
         feature_cols = get_numeric_features(df)
         if not feature_cols:
             print("ERROR: No numeric features found!")
@@ -196,12 +467,6 @@ def main():
         print("\n[6/6] Dimensionality Reduction...")
         plot_dimensionality_reduction(df, feature_scores, top_n=min(10, len(feature_scores)))
 
-        # Save final ranking CSV (fisher_ranking.csv)
-        fisher_ranking = feature_scores[['fisher_score']].reset_index()
-        fisher_ranking.columns = ['feature', 'fisher_score']
-        fisher_ranking.to_csv('fisher_ranking.csv', index=False)
-        print("\n✓ fisher_ranking.csv saved.")
-
         print("\n" + "=" * 70)
         print(" " * 25 + "ANALYSIS COMPLETE!")
         print("=" * 70)
@@ -212,6 +477,7 @@ def main():
         print("1. CSV files exist in './features' directory")
         print("2. cleaned_features.csv is present")
         print("3. File permissions are correct")
+
 
 if __name__ == "__main__":
     main()
