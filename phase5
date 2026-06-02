@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 """
-Phase 5: Find optimal K using OCSVM with fixed default hyperparameters.
-Evaluates with Leave-One-User-Out on the 13 dev users.
+Phase 5 – Optimal K selection using OCSVM (refined).
+- Uses only cleaned features from Phase 1.
+- Loads consensus ranking from Phase 3.
+- Tests multiple K values with fixed default OCSVM hyperparameters
+  (nu=0.1, gamma=1/K, threshold=0).
+- Evaluates via Leave-One-User-Out on the 13 development users.
+- Selects the best K based on minimum HTER (Half Total Error Rate).
+- Saves full results CSV and a K vs HTER plot.
+- Outputs the final chosen feature set.
 """
 
 import os, glob, warnings
@@ -10,109 +17,185 @@ import numpy as np
 from sklearn.svm import OneClassSVM
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score
+import matplotlib.pyplot as plt
 
 warnings.filterwarnings('ignore')
 
-DATA_DIR = './features'
-CONSENSUS_FILE = 'consensus_ranking.csv'
+# ======================= CONFIGURATION =======================
+DATA_DIR = "./features"
+CLEANED_FEATURES_FILE = "cleaned_features.csv"
+CONSENSUS_FILE = "consensus_ranking.csv"
 N_DEV_USERS = 13
+
 K_VALUES = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 120, 150]
-FAR_LIMIT = 0.005
+OCSVM_NU = 0.1                  # fixed
+OCSVM_THRESHOLD = 0.0           # fixed
+
+OUTPUT_RESULTS = "k_selection_results.csv"
+OUTPUT_FEATURES = "final_feature_set.csv"
+OUTPUT_PLOT = "k_vs_hter.png"
+# =============================================================
 
 # ------------------------------------------------------------------
-# 1. Load data for all dev users (similar to earlier scripts)
+# 1. Identify development users
 # ------------------------------------------------------------------
-train_files = sorted(glob.glob(os.path.join(DATA_DIR, '*_training_sessions.csv')))
-dev_users = [os.path.basename(f).replace('_training_sessions.csv', '') for f in train_files[:N_DEV_USERS]]
+train_files = sorted(glob.glob(os.path.join(DATA_DIR, "*_training_sessions.csv")))
+all_users = [os.path.basename(f).replace("_training_sessions.csv", "") for f in train_files]
+dev_users = all_users[:N_DEV_USERS]
+print(f"Development users: {dev_users}")
 
-def load_user(user):
-    train = pd.read_csv(os.path.join(DATA_DIR, f'{user}_training_sessions.csv'))
-    test = pd.read_csv(os.path.join(DATA_DIR, f'{user}_test_sessions.csv'))
+# ------------------------------------------------------------------
+# 2. Load cleaned feature list (from Phase 1)
+# ------------------------------------------------------------------
+cleaned_df = pd.read_csv(CLEANED_FEATURES_FILE)
+cleaned_features = cleaned_df['feature'].tolist()
+print(f"Cleaned features: {len(cleaned_features)}")
+
+# ------------------------------------------------------------------
+# 3. Data loading function (cleaned features only)
+# ------------------------------------------------------------------
+def load_user_data(user):
+    train = pd.read_csv(os.path.join(DATA_DIR, f"{user}_training_sessions.csv"))
+    test = pd.read_csv(os.path.join(DATA_DIR, f"{user}_test_sessions.csv"))
+    # Remove non-feature columns
     train.drop(columns=['user'], errors='ignore', inplace=True)
     test.drop(columns=['user'], errors='ignore', inplace=True)
+    # Extract labels (0=genuine, 1=impostor)
     y_test = test['label'].astype(int)
     test.drop(columns=['label'], inplace=True)
-    train = train.select_dtypes(include=[np.number]).fillna(0)
-    test = test.select_dtypes(include=[np.number]).fillna(0)
+    # Keep only cleaned features that exist
+    train = train[[c for c in cleaned_features if c in train.columns]]
+    test = test[[c for c in cleaned_features if c in test.columns]]
+    # Ensure numeric and fill remaining NaN with median
+    train = train.select_dtypes(include=[np.number])
+    test = test.select_dtypes(include=[np.number])
+    train = train.fillna(train.median())
+    test = test.fillna(test.median())
     return train, test, y_test
 
 # ------------------------------------------------------------------
-# 2. Pre-load all dev users
+# 4. Pre-load all dev user data
 # ------------------------------------------------------------------
 user_data = {}
 all_columns = None
 for user in dev_users:
-    train, test, y_test = load_user(user)
+    train, test, y_test = load_user_data(user)
     if all_columns is None:
         all_columns = train.columns.tolist()
+        print(f"Feature dimension after cleaning: {len(all_columns)}")
     else:
-        assert train.columns.tolist() == all_columns, f"Column mismatch for {user}"
+        # Ensure column consistency
+        if train.columns.tolist() != all_columns:
+            # Use only the common intersection
+            common = list(set(all_columns) & set(train.columns.tolist()))
+            train = train[common]
+            test = test[common]
+            all_columns = common
     user_data[user] = {'train': train, 'test': test, 'y_test': y_test}
 
 # ------------------------------------------------------------------
-# 3. Load consensus ranking
+# 5. Load consensus ranking
 # ------------------------------------------------------------------
-consensus = pd.read_csv(CONSENSUS_FILE)  # columns: feature, avg_percentile
+consensus = pd.read_csv(CONSENSUS_FILE)   # columns: feature, avg_percentile, ...
 ranked_features = consensus['feature'].tolist()
+# Build a mapping from feature name to column index in the actual data
 feature_to_idx = {name: i for i, name in enumerate(all_columns)}
 
 # ------------------------------------------------------------------
-# 4. Evaluate each K
+# 6. Evaluate each K
 # ------------------------------------------------------------------
-results = []
+results = []   # will hold tuples: (K, effective_K, acc, frr, far, hter)
+
 for k in K_VALUES:
-    # Select top-k features
+    # Select top-k features from consensus, ensuring they exist in our column space
     selected = [f for f in ranked_features[:k] if f in feature_to_idx]
     k_eff = len(selected)
     if k_eff == 0:
+        print(f"K={k} → no valid features, skipping.")
         continue
+
     idxs = [feature_to_idx[f] for f in selected]
-    
+    # gamma rule: 1 / number_of_features
+    gamma = 1.0 / k_eff
+
     accs, frrs, fars = [], [], []
     for user in dev_users:
         train = user_data[user]['train'].iloc[:, idxs].values.astype(float)
         test  = user_data[user]['test'].iloc[:, idxs].values.astype(float)
-        y_true = user_data[user]['y_test']
-        
+        y_true = user_data[user]['y_test'].values
+
         scaler = StandardScaler()
         train_scaled = scaler.fit_transform(train)
         test_scaled = scaler.transform(test)
-        
-        # Fixed hyperparameters as per agreement
-        ocsvm = OneClassSVM(kernel='rbf', nu=0.1, gamma=1.0/k_eff)
+
+        ocsvm = OneClassSVM(kernel='rbf', nu=OCSVM_NU, gamma=gamma)
         ocsvm.fit(train_scaled)
         scores = ocsvm.decision_function(test_scaled)
-        pred = (scores > 0).astype(int)   # 1=genuine
-        
-        genuine = y_true == 0
-        impostor = y_true == 1
-        frr = 1 - pred[genuine].mean() if genuine.sum()>0 else 0
-        far = pred[impostor].mean() if impostor.sum()>0 else 0
-        # accuracy mapping: pred 1 should match label 0 -> invert for sklearn
+        pred = (scores > OCSVM_THRESHOLD).astype(int)   # 1 = predicted genuine
+
+        genuine_mask = y_true == 0
+        impostor_mask = y_true == 1
+
+        frr = 1 - pred[genuine_mask].mean() if genuine_mask.sum() > 0 else 0.0
+        far = pred[impostor_mask].mean() if impostor_mask.sum() > 0 else 0.0
+
+        # accuracy: pred 1 should match label 0 → invert for sklearn
         acc = accuracy_score(1 - y_true, pred)
-        accs.append(acc); frrs.append(frr); fars.append(far)
-    
+
+        accs.append(acc)
+        frrs.append(frr)
+        fars.append(far)
+
     avg_acc = np.mean(accs)
     avg_frr = np.mean(frrs)
     avg_far = np.mean(fars)
-    results.append((k, k_eff, avg_acc, avg_frr, avg_far))
-    print(f"K={k:3d} (eff={k_eff:3d})  ACC={avg_acc:.4f}  FRR={avg_frr:.4f}  FAR={avg_far:.4f}")
+    hter = (avg_frr + avg_far) / 2.0
+
+    results.append((k, k_eff, avg_acc, avg_frr, avg_far, hter))
+    print(f"K={k:3d} (eff={k_eff:3d})  ACC={avg_acc:.4f}  FRR={avg_frr:.4f}  FAR={avg_far:.4f}  HTER={hter:.4f}")
 
 # ------------------------------------------------------------------
-# 5. Choose best K (highest accuracy while FAR <= limit)
+# 7. Save full results and choose best K (min HTER)
 # ------------------------------------------------------------------
-best = None
-for r in results:
-    if r[4] <= FAR_LIMIT:  # avg_far
-        if best is None or r[2] > best[2]:  # higher acc
-            best = r
-if best is None:
-    print("No K meets FAR limit, picking one with lowest FAR...")
-    best = min(results, key=lambda x: x[4])  # min FAR
+results_df = pd.DataFrame(results, columns=['K', 'EffectiveFeatures', 'Accuracy', 'FRR', 'FAR', 'HTER'])
+results_df.to_csv(OUTPUT_RESULTS, index=False)
+print(f"\nFull K‑selection results saved to {OUTPUT_RESULTS}")
 
-print(f"\nBest K = {best[0]}  (effective features = {best[1]})")
-print(f"  Dev Accuracy = {best[2]:.4f}, Dev FRR = {best[3]:.4f}, Dev FAR = {best[4]:.4f}")
-# Save the chosen feature list
-final_features = ranked_features[:best[1]]
-pd.Series(final_features).to_csv('final_feature_set.csv', index=False, header=['feature'])
-print("Final feature set saved to final_feature_set.csv")
+# Select the K with the smallest HTER
+best_row = results_df.loc[results_df['HTER'].idxmin()]
+best_k = int(best_row['K'])
+best_k_eff = int(best_row['EffectiveFeatures'])
+best_acc = best_row['Accuracy']
+best_frr = best_row['FRR']
+best_far = best_row['FAR']
+best_hter = best_row['HTER']
+
+print("\n=== Best K (minimum HTER) ===")
+print(f"K = {best_k}  (effective features = {best_k_eff})")
+print(f"Accuracy : {best_acc:.4f}")
+print(f"FRR      : {best_frr:.4f}")
+print(f"FAR      : {best_far:.4f}")
+print(f"HTER     : {best_hter:.4f}")
+
+# ------------------------------------------------------------------
+# 8. Save the final feature list (top‑K features)
+# ------------------------------------------------------------------
+final_features = [f for f in ranked_features[:best_k] if f in feature_to_idx][:best_k_eff]
+pd.Series(final_features).to_csv(OUTPUT_FEATURES, index=False, header=['feature'])
+print(f"Final feature set saved to {OUTPUT_FEATURES} ({len(final_features)} features).")
+
+# ------------------------------------------------------------------
+# 9. Plot K vs HTER
+# ------------------------------------------------------------------
+plt.figure(figsize=(8, 5))
+plt.plot(results_df['K'], results_df['HTER'], marker='o', linestyle='-', color='darkblue')
+plt.axvline(x=best_k, color='red', linestyle='--', alpha=0.7, label=f'Best K={best_k}')
+plt.xlabel('Number of Top Features (K)')
+plt.ylabel('HTER (Half Total Error Rate)')
+plt.title('K Selection via Leave-One-User-Out (Dev Users)')
+plt.legend()
+plt.grid(alpha=0.3)
+plt.tight_layout()
+plt.savefig(OUTPUT_PLOT, dpi=200)
+print(f"Plot saved as {OUTPUT_PLOT}")
+plt.show()
