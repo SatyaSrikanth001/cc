@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Phase 2A – Boruta + SHAP feature ranking with full visualisation.
-Input:
-  - ./features/*_training_sessions.csv (first 13 users used)
-  - cleaned_features.csv (from Phase 1)
-Output:
-  - boruta_shap_ranking.csv
-  - shap_importance.png
-  - shap_summary.png
+Phase 2A – Boruta + SHAP feature ranking (refined).
+- Uses 13 development users only.
+- Filters to cleaned features from Phase 1.
+- Boruta with multi:softprob objective.
+- Saves Boruta status (Selected/Tentative) along with SHAP importance.
+- Added XGBoost regularization for stable SHAP.
+- Median imputation instead of zero filling.
+- Saves Boruta survivor list separately.
 """
 
 import os, glob, warnings
@@ -34,7 +34,9 @@ XGB_PARAMS = {
     'n_estimators': 100,
     'max_depth': 5,
     'learning_rate': 0.1,
-    'objective': 'multi:softmax',
+    'objective': 'multi:softprob',      # probability outputs – better for SHAP
+    'subsample': 0.8,
+    'colsample_bytree': 0.8,
     'num_class': None,
     'n_jobs': -1,
     'random_state': 42
@@ -58,9 +60,7 @@ def plot_shap_bar(shap_values, feature_names, top_n=20):
     plt.show()
 
 def plot_shap_summary(shap_values, X_scaled, feature_names):
-    """SHAP summary plot (beeswarm) for the first class (or all)."""
-    # Use shap's internal plot, which might render to screen.
-    # We'll create a summary for the first class (class 0).
+    """SHAP summary plot (beeswarm) for the first class."""
     shap.summary_plot(shap_values[0], X_scaled, feature_names=feature_names, show=False)
     plt.tight_layout()
     plt.savefig("shap_summary.png", dpi=300, bbox_inches='tight')
@@ -93,7 +93,9 @@ for user in dev_users:
 
 full_df = pd.concat(dfs, ignore_index=True)
 y = full_df['user'].astype('category').cat.codes
-X = full_df.drop(columns=['user']).select_dtypes(include=[np.number]).fillna(0)
+X = full_df.drop(columns=['user']).select_dtypes(include=[np.number])
+# Impute with median (more robust than zero, Phase 1 already cleaned but just in case)
+X = X.fillna(X.median())
 feature_names = X.columns.tolist()
 print(f"Features after cleaning: {len(feature_names)}")
 
@@ -120,15 +122,28 @@ tentative_features = [feature_names[i] for i in range(len(feature_names)) if ten
 final_features = selected_features + tentative_features
 print(f"Boruta: {len(selected_features)} selected, {len(tentative_features)} tentative → using {len(final_features)} features.")
 
+# Create status mapping
+status_map = {}
+for f in selected_features:
+    status_map[f] = 'Selected'
+for f in tentative_features:
+    status_map[f] = 'Tentative'
+
 # 5. SHAP on surviving features -----------------------------------------------
 X_surv = X[final_features].copy()
 scaler_surv = StandardScaler()
 X_surv_scaled = scaler_surv.fit_transform(X_surv)
 
 xgb_shap = XGBClassifier(
-    n_estimators=100, max_depth=5, learning_rate=0.1,
-    objective='multi:softmax', num_class=num_classes,
-    random_state=42, n_jobs=-1
+    n_estimators=100,
+    max_depth=5,
+    learning_rate=0.1,
+    objective='multi:softprob',          # probability outputs
+    subsample=0.8,
+    colsample_bytree=0.8,
+    num_class=num_classes,
+    random_state=42,
+    n_jobs=-1
 )
 xgb_shap.fit(X_surv_scaled, y)
 
@@ -137,15 +152,22 @@ shap_values = explainer.shap_values(X_surv_scaled)   # list per class
 
 # Mean absolute SHAP importance
 mean_abs = np.mean(np.abs(np.stack(shap_values, axis=0)), axis=(0,1))
-importance_df = pd.DataFrame({'feature': final_features, 'shap_importance': mean_abs})
+importance_df = pd.DataFrame({
+    'feature': final_features,
+    'boruta_status': [status_map[f] for f in final_features],
+    'shap_importance': mean_abs
+})
 importance_df.sort_values('shap_importance', ascending=False, inplace=True)
 importance_df.to_csv(OUTPUT_RANKING, index=False)
 print(f"Saved {OUTPUT_RANKING}")
 
+# Save the Boruta survivors as a simple list (for debugging)
+pd.Series(final_features).to_csv("boruta_survivors.csv", index=False, header=["feature"])
+print("Saved boruta_survivors.csv")
+
 # 6. Visualizations -----------------------------------------------------------
 print("\nGenerating SHAP plots...")
 plot_shap_bar(shap_values, final_features, top_n=min(20, len(final_features)))
-# SHAP summary for first class (or we can use shap.summary_plot directly)
 if len(final_features) > 1:
     plot_shap_summary(shap_values, X_surv_scaled, final_features)
 print("Done.")
