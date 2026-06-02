@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """
 Phase 2C: Random Forest importance ranking using Leave-One-User-Out (LOUO).
-For each dev user, train RF on other dev users' genuine (train) + impostor (test) data,
-collect importance, and average across all dev users.
+- Loads the 13 development users only.
+- Filters training and test data to the cleaned features from Phase 1.
+- Treats label 0 = genuine, 1 = impostor.
+- Handles class imbalance via class_weight='balanced'.
+- Uses 300 trees for stable feature importance.
+- Saves per-fold importances in 'rf_folds/' folder and the final averaged ranking.
 """
 
 import os, glob, warnings
@@ -13,85 +17,136 @@ from sklearn.preprocessing import StandardScaler
 
 warnings.filterwarnings('ignore')
 
-DATA_DIR = './features'
-DEV_USERS_FILE = 'dev_users.txt'   # optional file listing dev users (one per line)
+# ======================= CONFIGURATION =======================
+DATA_DIR = "./features"
+CLEANED_FEATURES_FILE = "cleaned_features.csv"
 N_DEV_USERS = 13
-RANK_OUTPUT = 'rf_louo_importance.csv'
+OUTPUT_AVG_RANKING = "rf_louo_importance.csv"
+OUTPUT_FOLDS_DIR = "rf_folds"
+# =============================================================
 
 # ------------------------------------------------------------------
 # 1. Identify dev users
 # ------------------------------------------------------------------
-train_files = sorted(glob.glob(os.path.join(DATA_DIR, '*_training_sessions.csv')))
-all_users = [os.path.basename(f).replace('_training_sessions.csv', '') for f in train_files]
+train_files = sorted(glob.glob(os.path.join(DATA_DIR, "*_training_sessions.csv")))
+all_users = [os.path.basename(f).replace("_training_sessions.csv", "") for f in train_files]
+if len(all_users) < N_DEV_USERS:
+    raise ValueError(f"Need at least {N_DEV_USERS} users, found {len(all_users)}")
 dev_users = all_users[:N_DEV_USERS]
-print(f"Dev users: {dev_users}")
+print(f"Development users: {dev_users}")
 
 # ------------------------------------------------------------------
-# 2. Load data for a user (training and test)
+# 2. Load cleaned feature list
+# ------------------------------------------------------------------
+cleaned_df = pd.read_csv(CLEANED_FEATURES_FILE)
+cleaned_features = cleaned_df['feature'].tolist()
+print(f"Cleaned features: {len(cleaned_features)}")
+
+# ------------------------------------------------------------------
+# 3. Data loading function (now filters to cleaned features)
 # ------------------------------------------------------------------
 def load_user(user):
-    train = pd.read_csv(os.path.join(DATA_DIR, f'{user}_training_sessions.csv'))
-    test = pd.read_csv(os.path.join(DATA_DIR, f'{user}_test_sessions.csv'))
+    """Load training and test data for a user, filtering to cleaned features."""
+    train_path = os.path.join(DATA_DIR, f"{user}_training_sessions.csv")
+    test_path = os.path.join(DATA_DIR, f"{user}_test_sessions.csv")
+
+    train = pd.read_csv(train_path)
+    test = pd.read_csv(test_path)
+
     # Remove non-feature columns
     train.drop(columns=['user'], errors='ignore', inplace=True)
     test.drop(columns=['user'], errors='ignore', inplace=True)
-    # Extract labels from test (assume column 'label', 0=genuine, 1=impostor)
+
+    # Extract labels (assumption: 'label' column, 0 = genuine, 1 = impostor)
     y_test = test['label'].astype(int)
     test.drop(columns=['label'], inplace=True)
-    # Keep only numeric and fill missing
-    train = train.select_dtypes(include=[np.number]).fillna(0)
-    test = test.select_dtypes(include=[np.number]).fillna(0)
-    return train, test, y_test
+
+    # Keep only cleaned features that exist in the data
+    available_train = [f for f in cleaned_features if f in train.columns]
+    available_test = [f for f in cleaned_features if f in test.columns]
+    # Use only the common set to avoid mismatches
+    common_features = list(set(available_train) & set(available_test))
+    if not common_features:
+        raise RuntimeError(f"No common cleaned features for user {user}")
+
+    train = train[common_features]
+    test = test[common_features]
+
+    # Ensure numeric and fill any remaining NaN with median (per column)
+    train = train.select_dtypes(include=[np.number])
+    test = test.select_dtypes(include=[np.number])
+    train = train.fillna(train.median())
+    test = test.fillna(test.median())
+
+    return train, test, y_test, common_features
 
 # ------------------------------------------------------------------
-# 3. LOUO loop
+# 4. LOUO loop
 # ------------------------------------------------------------------
-feature_names = None
-importances_sum = None
+# First, get the global feature list from the first dev user (all users should have the same cleaned columns)
+_, _, _, feature_names = load_user(dev_users[0])
+print(f"Common features across all users: {len(feature_names)}")
+
+# Create output directory for per-fold importances
+os.makedirs(OUTPUT_FOLDS_DIR, exist_ok=True)
+
+importances_sum = np.zeros(len(feature_names))
 count = 0
 
 for target_user in dev_users:
-    # Build development set from other users
     X_list, y_list = [], []
     for other_user in dev_users:
         if other_user == target_user:
             continue
-        train_other, test_other, y_test_other = load_user(other_user)
-        # Genuine from training (label 0)
+        train_other, test_other, y_test_other, _ = load_user(other_user)
+
+        # Genuine samples from training (label 0)
         X_list.append(train_other.values)
         y_list.append(np.zeros(len(train_other)))
-        # Impostor from test (label 1)
-        impostor_mask = y_test_other == 1
-        if impostor_mask.sum() > 0:
-            X_list.append(test_other.values[impostor_mask])
-            y_list.append(np.ones(impostor_mask.sum()))
+
+        # Impostor samples from test (label 1)
+        imp_mask = y_test_other == 1
+        if imp_mask.sum() > 0:
+            X_list.append(test_other.values[imp_mask])
+            y_list.append(np.ones(imp_mask.sum()))
+
     if not X_list:
         continue
+
     X_dev = np.vstack(X_list)
-    y_dev = np.hstack(y_list)
-    
-    if feature_names is None:
-        # Use columns from the first training dataframe (all should be same)
-        train_ref, _, _ = load_user(dev_users[0])
-        feature_names = train_ref.columns.tolist()
-    
+    y_dev = np.hstack(y_list).astype(int)
+
     # Standardize
     scaler = StandardScaler()
     X_dev_scaled = scaler.fit_transform(X_dev)
-    
-    # Train RF
-    rf = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
+
+    # Train Random Forest with class balancing and more trees
+    rf = RandomForestClassifier(
+        n_estimators=300,
+        class_weight='balanced',
+        random_state=42,
+        n_jobs=-1
+    )
     rf.fit(X_dev_scaled, y_dev)
-    
-    if importances_sum is None:
-        importances_sum = rf.feature_importances_.copy()
-    else:
-        importances_sum += rf.feature_importances_
+
+    # Save per-fold importance (for this target_user)
+    fold_importance = rf.feature_importances_
+    fold_df = pd.DataFrame({
+        'feature': feature_names,
+        'importance': fold_importance
+    }).sort_values('importance', ascending=False)
+    fold_df.to_csv(os.path.join(OUTPUT_FOLDS_DIR, f"rf_importance_{target_user}.csv"), index=False)
+
+    importances_sum += fold_importance
     count += 1
 
-# Average importances
+# Average importances across folds
 avg_importances = importances_sum / count
-importance_df = pd.DataFrame({'feature': feature_names, 'importance': avg_importances})
-importance_df.sort_values('importance', ascending=False, inplace=True)
-importance_df.to_csv(RANK_OUTPUT, index=False)
-print(f"Saved RF LOUO importance to {RANK_OUTPUT}")
+importance_df = pd.DataFrame({
+    'feature': feature_names,
+    'importance': avg_importances
+}).sort_values('importance', ascending=False)
+
+importance_df.to_csv(OUTPUT_AVG_RANKING, index=False)
+print(f"Saved average RF importance to {OUTPUT_AVG_RANKING}")
+print(f"Per-fold importances saved in '{OUTPUT_FOLDS_DIR}/'")
