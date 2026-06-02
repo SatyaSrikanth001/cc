@@ -1,0 +1,87 @@
+#!/usr/bin/env python3
+"""
+Phase 2B – Fisher Score feature ranking on the 13 development users.
+Input:
+  - ./features/*_training_sessions.csv (first 13 dev users)
+  - cleaned_features.csv (from Phase 1)
+Output:
+  - fisher_ranking.csv   (columns: feature, fisher_score)
+"""
+
+import os, glob, warnings
+import pandas as pd
+import numpy as np
+
+warnings.filterwarnings('ignore')
+
+# ======================= CONFIGURATION =======================
+DATA_DIR = "./features"
+CLEANED_FEATURES_FILE = "cleaned_features.csv"
+OUTPUT_RANKING = "fisher_ranking.csv"
+N_DEV_USERS = 13
+# =============================================================
+
+# 1. Identify dev users
+all_train_files = sorted(glob.glob(os.path.join(DATA_DIR, "*_training_sessions.csv")))
+all_users = [os.path.basename(f).replace("_training_sessions.csv", "") for f in all_train_files]
+dev_users = all_users[:N_DEV_USERS]
+print(f"Development users: {dev_users}")
+
+# 2. Load cleaned feature list
+cleaned_df = pd.read_csv(CLEANED_FEATURES_FILE)
+cleaned_features = cleaned_df['feature'].tolist()
+print(f"Using {len(cleaned_features)} cleaned features.")
+
+# 3. Combine training data of dev users
+dfs = []
+for user in dev_users:
+    file_path = os.path.join(DATA_DIR, f"{user}_training_sessions.csv")
+    df = pd.read_csv(file_path)
+    available_features = [f for f in cleaned_features if f in df.columns]
+    if not available_features:
+        continue
+    df = df[available_features].copy()
+    df['user'] = user
+    dfs.append(df)
+
+full_df = pd.concat(dfs, ignore_index=True)
+print(f"Combined shape: {full_df.shape}")
+
+# 4. Calculate Fisher score for each feature
+features_to_score = [c for c in full_df.columns if c != 'user']
+scores = {}
+
+for feature in features_to_score:
+    try:
+        feature_data = pd.to_numeric(full_df[feature], errors='coerce')
+        temp_df = pd.DataFrame({'feature': feature_data, 'user': full_df['user']}).dropna()
+        if temp_df.empty:
+            continue
+
+        overall_mean = temp_df['feature'].mean()
+        user_means = temp_df.groupby('user')['feature'].mean()
+        user_counts = temp_df.groupby('user')['feature'].count()
+
+        between_var = np.sum(user_counts * (user_means - overall_mean) ** 2) / len(temp_df)
+        within_var = temp_df.groupby('user')['feature'].var().mean()
+
+        if pd.isna(within_var) or within_var == 0:
+            within_var = 1e-10
+
+        fisher_score = between_var / (within_var + 1e-10)
+        scores[feature] = fisher_score
+    except Exception as e:
+        print(f"Warning: could not process {feature} - {e}")
+        continue
+
+if not scores:
+    raise ValueError("No features could be scored.")
+
+fisher_series = pd.Series(scores, name='fisher_score')
+fisher_series.index.name = 'feature'
+fisher_df = fisher_series.reset_index().sort_values('fisher_score', ascending=False)
+
+fisher_df.to_csv(OUTPUT_RANKING, index=False)
+print(f"Saved {OUTPUT_RANKING} with {len(fisher_df)} features.")
+print("Top 10:")
+print(fisher_df.head(10))
