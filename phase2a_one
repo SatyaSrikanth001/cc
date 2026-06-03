@@ -1,22 +1,29 @@
 #!/usr/bin/env python3
 """
-Phase 2A – Boruta + SHAP feature ranking on the 13 development users.
-Input:
-  - ./features/*_training_sessions.csv (only the first 13 dev users used)
-  - cleaned_features.csv (from Phase 1)
-Output:
-  - boruta_shap_ranking.csv   (columns: feature, shap_importance)
+Phase 2A – Boruta + SHAP feature ranking (refined).
+- Uses 13 development users only.
+- Filters to cleaned features from Phase 1.
+- Boruta with multi:softprob objective.
+- Saves Boruta status (Selected/Tentative) along with SHAP importance.
+- Added XGBoost regularization for stable SHAP.
+- Median imputation instead of zero filling.
+- Saves Boruta survivor list separately.
+- Fixed: ensures mean_abs is always 1‑D; plots use correct feature list.
 """
 
 import os, glob, warnings
 import pandas as pd
 import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
 from sklearn.preprocessing import StandardScaler
 from xgboost import XGBClassifier
 from boruta import BorutaPy
 import shap
 
 warnings.filterwarnings('ignore')
+sns.set_style("whitegrid")
+plt.rcParams['figure.dpi'] = 100
 
 # ======================= CONFIGURATION =======================
 DATA_DIR = "./features"
@@ -24,13 +31,14 @@ CLEANED_FEATURES_FILE = "cleaned_features.csv"
 OUTPUT_RANKING = "boruta_shap_ranking.csv"
 N_DEV_USERS = 13
 
-# Boruta / XGBoost parameters
 XGB_PARAMS = {
     'n_estimators': 100,
     'max_depth': 5,
     'learning_rate': 0.1,
-    'objective': 'multi:softmax',
-    'num_class': None,          # will be set after counting users
+    'objective': 'multi:softprob',
+    'subsample': 0.8,
+    'colsample_bytree': 0.8,
+    'num_class': None,
     'n_jobs': -1,
     'random_state': 42
 }
@@ -38,70 +46,73 @@ BORUTA_MAX_ITER = 100
 BORUTA_PERC = 90
 # =============================================================
 
-# 1. Identify the 13 development users ---------------------------------------
+# --- Helper plot functions -----------------------------------
+def plot_shap_bar(shap_values, feature_names, top_n=20):
+    """Horizontal bar chart of mean absolute SHAP values."""
+    mean_abs_shap = np.mean(np.abs(np.stack(shap_values, axis=0)), axis=(0, 1))
+    idx = np.argsort(mean_abs_shap)[-top_n:]
+    plt.figure(figsize=(10, 6))
+    plt.barh(range(len(idx)), mean_abs_shap[idx], color='steelblue')
+    plt.yticks(range(len(idx)), [feature_names[i] for i in idx])
+    plt.xlabel("Mean |SHAP value|")
+    plt.title(f"Top {top_n} SHAP Feature Importance (Boruta survivors)")
+    plt.tight_layout()
+    plt.savefig("shap_importance.png", dpi=300, bbox_inches='tight')
+    plt.show()
+
+def plot_shap_summary(shap_values, X_scaled, feature_names):
+    """SHAP summary plot (beeswarm) for the first class."""
+    shap.summary_plot(shap_values[0], X_scaled, feature_names=feature_names, show=False)
+    plt.tight_layout()
+    plt.savefig("shap_summary.png", dpi=300, bbox_inches='tight')
+    plt.show()
+
+# 1. Identify dev users --------------------------------------------------------
 all_train_files = sorted(glob.glob(os.path.join(DATA_DIR, "*_training_sessions.csv")))
 all_users = [os.path.basename(f).replace("_training_sessions.csv", "") for f in all_train_files]
 if len(all_users) < N_DEV_USERS:
     raise ValueError(f"Need at least {N_DEV_USERS} users, found {len(all_users)}")
-
 dev_users = all_users[:N_DEV_USERS]
 print(f"Development users: {dev_users}")
 
-# 2. Load cleaned feature list -----------------------------------------------
-cleaned_df = pd.read_csv(CLEANED_FEATURES_FILE)   # must contain a column 'feature'
-if 'feature' not in cleaned_df.columns:
-    raise KeyError("cleaned_features.csv must have a 'feature' column")
+# 2. Load cleaned features ----------------------------------------------------
+cleaned_df = pd.read_csv(CLEANED_FEATURES_FILE)
 cleaned_features = cleaned_df['feature'].tolist()
-print(f"Using {len(cleaned_features)} cleaned features.")
+print(f"Cleaned features: {len(cleaned_features)}")
 
-# 3. Load and combine training data of the dev users (genuine only) -----------
+# 3. Combine training data of dev users (genuine only) ------------------------
 dfs = []
 for user in dev_users:
     file_path = os.path.join(DATA_DIR, f"{user}_training_sessions.csv")
     df = pd.read_csv(file_path)
-    # Keep only cleaned features that exist in this file
-    available_features = [f for f in cleaned_features if f in df.columns]
-    if not available_features:
-        print(f"Warning: user {user} has no matching cleaned features!")
+    available = [f for f in cleaned_features if f in df.columns]
+    if not available:
         continue
-    df = df[available_features].copy()
+    df = df[available].copy()
     df['user'] = user
     dfs.append(df)
 
 full_df = pd.concat(dfs, ignore_index=True)
-print(f"Combined shape: {full_df.shape}")
-
-# Separate labels and features
 y = full_df['user'].astype('category').cat.codes
-X = full_df.drop(columns=['user'])
-
-# Ensure numeric and fill missing
-X = X.select_dtypes(include=[np.number])
-if X.isna().sum().sum() > 0:
-    X = X.fillna(0)
-
+X = full_df.drop(columns=['user']).select_dtypes(include=[np.number])
+# Impute with median
+X = X.fillna(X.median())
 feature_names = X.columns.tolist()
-print(f"Features for Boruta: {len(feature_names)}")
+print(f"Features after cleaning: {len(feature_names)}")
 
-# Standardise
 scaler = StandardScaler()
 X_scaled = scaler.fit_transform(X)
 
-# 4. Boruta feature selection -------------------------------------------------
+# 4. Boruta selection ---------------------------------------------------------
 num_classes = len(np.unique(y))
 xgb_params = XGB_PARAMS.copy()
 xgb_params['num_class'] = num_classes
-
 xgb = XGBClassifier(**xgb_params)
-feat_selector = BorutaPy(
-    xgb,
-    n_estimators='auto',
-    verbose=2,
-    random_state=42,
-    max_iter=BORUTA_MAX_ITER,
-    perc=BORUTA_PERC
-)
 
+feat_selector = BorutaPy(
+    xgb, n_estimators='auto', verbose=2, random_state=42,
+    max_iter=BORUTA_MAX_ITER, perc=BORUTA_PERC
+)
 print("Running Boruta...")
 feat_selector.fit(X_scaled, y)
 
@@ -109,45 +120,64 @@ selected_mask = feat_selector.support_
 tentative_mask = feat_selector.support_weak_
 selected_features = [feature_names[i] for i in range(len(feature_names)) if selected_mask[i]]
 tentative_features = [feature_names[i] for i in range(len(feature_names)) if tentative_mask[i] and not selected_mask[i]]
-final_features = selected_features + tentative_features   # keep both to be safe
-print(f"Selected: {len(selected_features)}, Tentative: {len(tentative_features)}")
+final_features = selected_features + tentative_features
+print(f"Boruta: {len(selected_features)} selected, {len(tentative_features)} tentative -> using {len(final_features)} features.")
 
-if not final_features:
-    raise RuntimeError("No features survived Boruta. Try lowering the percentile or check data.")
+# Create status mapping
+status_map = {}
+for f in selected_features:
+    status_map[f] = 'Selected'
+for f in tentative_features:
+    status_map[f] = 'Tentative'
 
-# 5. SHAP importance on surviving features ------------------------------------
+# 5. SHAP on surviving features -----------------------------------------------
 X_surv = X[final_features].copy()
-# Re‑scale (optional but safe)
 scaler_surv = StandardScaler()
 X_surv_scaled = scaler_surv.fit_transform(X_surv)
 
-# Train fresh XGBoost for SHAP
 xgb_shap = XGBClassifier(
     n_estimators=100,
     max_depth=5,
     learning_rate=0.1,
-    objective='multi:softmax',
+    objective='multi:softprob',
+    subsample=0.8,
+    colsample_bytree=0.8,
     num_class=num_classes,
     random_state=42,
     n_jobs=-1
 )
 xgb_shap.fit(X_surv_scaled, y)
 
-# SHAP explainer
 explainer = shap.TreeExplainer(xgb_shap)
-shap_values = explainer.shap_values(X_surv_scaled)   # list of arrays (one per class)
+shap_values = explainer.shap_values(X_surv_scaled)   # list per class
 
-# Mean absolute SHAP across all classes and samples
-shap_importances = np.mean(np.abs(np.stack(shap_values, axis=0)), axis=(0,1))
+# Mean absolute SHAP importance – ensure it's a 1‑D array
+mean_abs = np.atleast_1d(
+    np.mean(np.abs(np.stack(shap_values, axis=0)), axis=(0, 1))
+)
+
+# Safety check: all lengths must match
+n_feat = len(final_features)
+assert len(mean_abs) == n_feat, f"mean_abs length {len(mean_abs)} != final_features length {n_feat}"
+assert len([status_map[f] for f in final_features]) == n_feat
 
 importance_df = pd.DataFrame({
     'feature': final_features,
-    'shap_importance': shap_importances
+    'boruta_status': [status_map[f] for f in final_features],
+    'shap_importance': mean_abs
 })
 importance_df.sort_values('shap_importance', ascending=False, inplace=True)
-importance_df.reset_index(drop=True, inplace=True)
-
 importance_df.to_csv(OUTPUT_RANKING, index=False)
-print(f"Saved {OUTPUT_RANKING} with {len(importance_df)} features.")
-print("Top 10:")
-print(importance_df.head(10))
+print(f"Saved {OUTPUT_RANKING}")
+
+# Save the Boruta survivors as a simple list
+pd.Series(final_features).to_csv("boruta_survivors.csv", index=False, header=["feature"])
+print("Saved boruta_survivors.csv")
+
+# 6. Visualizations -----------------------------------------------------------
+print("\nGenerating SHAP plots...")
+# Use final_features (the survivors) for plots, NOT the full feature_names
+plot_shap_bar(shap_values, final_features, top_n=min(20, len(final_features)))
+if len(final_features) > 1:
+    plot_shap_summary(shap_values, X_surv_scaled, final_features)
+print("Done.")
