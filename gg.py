@@ -1,19 +1,15 @@
-def load_user_data(user):
-    train = pd.read_csv(os.path.join(DATA_DIR, f"{user}_training_sessions.csv"))
-    test = pd.read_csv(os.path.join(DATA_DIR, f"{user}_testing_sessions.csv"))
+import json
+import numpy as np
 
-    # Remove non-feature columns
-    train.drop(columns=['user'], errors='ignore', inplace=True)
-    test.drop(columns=['user'], errors='ignore', inplace=True)
+with open("one_user.json") as f:
+    data = json.load(f)
 
-    # ---- ADD DIAGNOSTIC HERE (before mapping, before dropping label) ----
-    print(f"Labels for {user}:", test['label'].unique())
-    # -------------------------------------------------------------------
+session = data["data"]["sessions"]["sessions"][0]
 
-    # Extract labels (0=genuine, 1=impostor)
-    label_map = {'genuine': 0, 'impostor': 1}
-    y_test = test['label'].map(label_map)
+timestamps = [
+    e["timestamp"]
+    for e in session["sensor_events"]
+]
 
-    test.drop(columns=['label'], inplace=True)
-
-    # ... rest of the function ...
+print("events =", len(timestamps))
+print("unique =", len(set(timestamps)))
