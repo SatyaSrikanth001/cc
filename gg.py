@@ -1,195 +1,119 @@
-# ================================================================
-# MFCC HELPERS & EXTRACTION
-# ================================================================
-@staticmethod
-def _hz2mel(hz):
-    return 2595.0 * np.log10(1 + hz / 700.0)
+#!/usr/bin/env python3
+"""
+Naive hyperparameter tuning – trains on each user's own genuine data,
+tests on their test set, computes global average TAR.
+WARNING: This method overfits to the test set because you use it directly for selection.
+Use only for rough exploration.
+"""
 
-@staticmethod
-def _mel2hz(mel):
-    return 700.0 * (10.0**(mel / 2595.0) - 1.0)
+import os, glob, warnings
+import pandas as pd
+import numpy as np
+from sklearn.svm import OneClassSVM
+from sklearn.preprocessing import StandardScaler
 
-def _extract_mfcc_features(self, signal, prefix, fs, num_ceps=6):
-    """
-    Extract MFCC features using sliding windows.
-    Returns mean, std, and delta (first‑order difference) for each coefficient.
-    """
-    signal = np.array(signal, dtype=np.float64)
-    if len(signal) < 32:
-        # Return zeros
-        feats = {}
-        for i in range(num_ceps):
-            feats[f'{prefix}_mfcc_{i}_mean'] = 0.0
-            feats[f'{prefix}_mfcc_{i}_std'] = 0.0
-            feats[f'{prefix}_mfcc_{i}_delta'] = 0.0
-        return feats
+# ---- import your existing class ----
+from your_training_script import SessionOCSVM   # adjust import
 
-    window_size = int(2 * fs)
-    window_size = max(16, min(window_size, 64))
-    hop_size = window_size // 2
+warnings.filterwarnings('ignore')
 
-    # Build mel filterbank (adapted for low sampling rate)
-    nfilt = 12
-    low_freq = 0.5
-    high_freq = fs / 2 - 0.5
-    mel_points = np.linspace(self._hz2mel(low_freq),
-                             self._hz2mel(high_freq),
-                             nfilt + 2)
-    hz_points = self._mel2hz(mel_points)
-    bin = np.floor((window_size // 2 + 1) * hz_points / (fs / 2))
+DATA_DIR = "./features"
+TRAIN_PATTERN = "*_training_sessions.csv"
+TEST_PATTERN = "*_testing_sessions.csv"
+N_USERS = 3
+FAR_LIMIT = 0.005
 
-    fbank = np.zeros((nfilt, window_size // 2 + 1))
-    for m in range(1, nfilt + 1):
-        f_m_minus = int(bin[m-1])
-        f_m = int(bin[m])
-        f_m_plus = int(bin[m+1])
-        for k in range(f_m_minus, f_m):
-            fbank[m-1, k] = (k - bin[m-1]) / (bin[m] - bin[m-1] + 1e-10)
-        for k in range(f_m, f_m_plus):
-            fbank[m-1, k] = (bin[m+1] - k) / (bin[m+1] - bin[m] + 1e-10)
+NU_VALUES = [0.01, 0.02, 0.05, 0.1, 0.2, 0.3]
+THRESHOLD_VALUES = [-0.3, -0.2, -0.1, 0.0, 0.1, 0.2]
+FIXED_GAMMA = 0.00055
+GAMMA_MULTIPLIERS = [0.1, 0.5, 1.0, 2.0, 5.0]
 
-    mfccs_all = []
-    for i in range(0, len(signal) - window_size, hop_size):
-        chunk = signal[i:i+window_size] * np.hamming(window_size)
-        mag_spec = np.abs(np.fft.rfft(chunk))
-        mag_spec = np.clip(mag_spec, 1e-12, None)
-        fb_energies = np.dot(fbank, mag_spec)
-        log_energies = np.log(fb_energies + 1e-12)
-        # DCT to get cepstral coefficients
-        mfcc = np.zeros(num_ceps)
-        for n in range(num_ceps):
-            mfcc[n] = np.sum(log_energies *
-                             np.cos(np.pi * (n+1) *
-                                    (np.arange(nfilt)+0.5) / nfilt))
-        mfccs_all.append(mfcc)
+# 1. User list
+train_files = sorted(glob.glob(os.path.join(DATA_DIR, TRAIN_PATTERN)))
+all_users = [os.path.basename(f).replace("_training_sessions.csv", "") for f in train_files]
+users = all_users[:N_USERS]
+print(f"Users: {users}")
 
-    if not mfccs_all:
-        feats = {}
-        for i in range(num_ceps):
-            feats[f'{prefix}_mfcc_{i}_mean'] = 0.0
-            feats[f'{prefix}_mfcc_{i}_std'] = 0.0
-            feats[f'{prefix}_mfcc_{i}_delta'] = 0.0
-        return feats
+# 2. Pre‑load data for each user (features already selected via drop_cols in class)
+user_data = {}
+feature_count = None
+for user in users:
+    model = SessionOCSVM(user)
+    X_train, X_test, y_test, _, _ = model.load_and_prepare_data(
+        os.path.join(DATA_DIR, f"{user}_training_sessions.csv"),
+        os.path.join(DATA_DIR, f"{user}_testing_sessions.csv")
+    )
+    user_data[user] = {'X_train': X_train, 'X_test': X_test, 'y_test': y_test}
+    if feature_count is None:
+        feature_count = X_train.shape[1]
+    else:
+        assert X_train.shape[1] == feature_count, "Feature count mismatch"
 
-    mfccs_all = np.array(mfccs_all)      # (n_windows, num_ceps)
-    mean_mfcc = np.mean(mfccs_all, axis=0)
-    std_mfcc = np.std(mfccs_all, axis=0)
-    delta_mfcc = (np.mean(np.diff(mfccs_all, axis=0), axis=0)
-                  if mfccs_all.shape[0] > 1 else np.zeros(num_ceps))
+n_features = feature_count
+print(f"Number of features: {n_features}")
 
-    features = {}
-    for i in range(num_ceps):
-        features[f'{prefix}_mfcc_{i}_mean'] = float(mean_mfcc[i])
-        features[f'{prefix}_mfcc_{i}_std'] = float(std_mfcc[i])
-        features[f'{prefix}_mfcc_{i}_delta'] = float(delta_mfcc[i])
-    return features
+# 3. Gamma candidates
+gamma_candidates = [FIXED_GAMMA] + [mult / n_features for mult in GAMMA_MULTIPLIERS]
+gamma_candidates = sorted(set(gamma_candidates))
 
-# ================================================================
-# MULTITAPER FFT EXTRACTION
-# ================================================================
-def _extract_multitaper_features(self, signal, prefix, fs, num_tapers=3):
-    """
-    Compute spectral descriptors using multitaper estimation (DPSS).
-    Returns the same seven descriptors as _extract_windowed_fft, but far more stable.
-    """
-    signal = np.array(signal, dtype=np.float64)
-    if len(signal) < 32:
-        return self._fft_defaults(prefix)  # reuse existing zero dict
+# 4. Loop over all combinations
+best_tar = -1
+best_params = None
+results = []
 
-    window_size = int(2 * fs)
-    window_size = max(16, min(window_size, 64))
-    hop_size = window_size // 2
+for nu in NU_VALUES:
+    for gamma in gamma_candidates:
+        for thr in THRESHOLD_VALUES:
+            global_tars = []
+            global_fars = []
+            global_frrs = []
+            for user in users:
+                X_train = user_data[user]['X_train']
+                X_test = user_data[user]['X_test']
+                y_test = user_data[user]['y_test']
 
-    from scipy.signal import windows
-    tapers = windows.dpss(window_size, NW=num_tapers, return_ratios=False)
-    # shape (num_tapers, window_size)
+                scaler = StandardScaler()
+                X_train_scaled = scaler.fit_transform(X_train)
+                X_test_scaled = scaler.transform(X_test)
 
-    peak_freqs, energies, entropies, band_lows, band_mids = [], [], [], [], []
-    energy_centroids, energy_medoids = [], []
+                ocsvm = OneClassSVM(kernel='rbf', nu=nu, gamma=gamma)
+                ocsvm.fit(X_train_scaled)
+                scores = ocsvm.decision_function(X_test_scaled)
+                pred = (scores > thr).astype(int)
 
-    for i in range(0, len(signal) - window_size, hop_size):
-        chunk = signal[i:i+window_size]
-        # Compute multitaper spectrum (average periodograms)
-        psd_mt = np.zeros(window_size // 2 + 1)
-        for taper in tapers:
-            windowed = chunk * taper
-            fft_vals = np.abs(np.fft.rfft(windowed))
-            psd_mt += fft_vals ** 2
-        psd_mt /= num_tapers
+                genuine = y_test == 1
+                impostor = y_test == -1
+                frr = 1.0 - pred[genuine].mean() if genuine.sum() > 0 else 0.0
+                far = pred[impostor].mean() if impostor.sum() > 0 else 0.0
+                global_frrs.append(frr)
+                global_fars.append(far)
+                global_tars.append(1.0 - frr)
 
-        freqs = np.fft.rfftfreq(window_size, d=1/fs)
-        pos_mask = freqs > 0
-        freqs = freqs[pos_mask]
-        power = psd_mt[pos_mask]
-        power = np.clip(power, 1e-12, None)
-        prob = power / np.sum(power)
+            avg_frr = np.mean(global_frrs)
+            avg_far = np.mean(global_fars)
+            avg_tar = np.mean(global_tars)
+            results.append((nu, gamma, thr, avg_tar, avg_frr, avg_far))
 
-        # --- same descriptors as your original _extract_windowed_fft ---
-        peak_idx = np.argmax(power)
-        peak_freqs.append(freqs[peak_idx])
-        energies.append(np.sum(power))
+            if avg_far <= FAR_LIMIT and avg_tar > best_tar:
+                best_tar = avg_tar
+                best_params = {
+                    'nu': nu,
+                    'gamma': gamma,
+                    'threshold': thr,
+                    'TAR': avg_tar,
+                    'FRR': avg_frr,
+                    'FAR': avg_far
+                }
 
-        entropy = -np.sum(prob * np.log(prob))
-        entropy /= np.log(len(prob)) if len(prob) > 1 else 1e-10
-        entropies.append(entropy)
-
-        centroid = np.sum(freqs * power) / (energies[-1] + 1e-10)
-        energy_centroids.append(centroid)
-
-        cum_energy = np.cumsum(power)
-        medoid_idx = np.searchsorted(cum_energy, 0.5 * cum_energy[-1])
-        medoid_idx = min(medoid_idx, len(freqs)-1)
-        energy_medoids.append(freqs[medoid_idx])
-
-        band_low_mask = (freqs >= 0.5) & (freqs <= 2)
-        band_mid_mask = (freqs >= 2) & (freqs <= 5)
-        band_lows.append(np.sum(power[band_low_mask]) if np.any(band_low_mask) else 0.0)
-        band_mids.append(np.sum(power[band_mid_mask]) if np.any(band_mid_mask) else 0.0)
-
-    if not peak_freqs:
-        return self._fft_defaults(prefix)
-
-    return {
-        f'{prefix}_mt_peak_freq': float(np.mean(peak_freqs)),
-        f'{prefix}_mt_spectral_energy': float(np.mean(energies)),
-        f'{prefix}_mt_spectral_entropy': float(np.mean(entropies)),
-        f'{prefix}_mt_band_low_0_2hz': float(np.mean(band_lows)),
-        f'{prefix}_mt_band_mid_2_5hz': float(np.mean(band_mids)),
-        f'{prefix}_mt_centroid': float(np.mean(energy_centroids)),
-        f'{prefix}_mt_medoid': float(np.mean(energy_medoids)),
-    }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-if len(acc_x) > 20:
-
-    # --- Magnitude (existing + new) ---
-    acc_mag = np.sqrt(acc_x**2 + acc_y**2 + acc_z**2)
-    acc_mag_active = self._get_active_segments(acc_mag)
-    if len(acc_mag_active) > 20:
-        # Keep your original windowed FFT
-        features.update(self._extract_windowed_fft(acc_mag_active, 'acc', fs))
-        # ADD MFCC and Multitaper
-        features.update(self._extract_mfcc_features(acc_mag_active, 'acc_mag', fs))
-        features.update(self._extract_multitaper_features(acc_mag_active, 'acc_mag', fs))
-
-    # --- Per-axis: X, Y, Z (if you haven't implemented per-axis, add now) ---
-    for axis_name, axis_signal in [('acc_x', acc_x), ('acc_y', acc_y), ('acc_z', acc_z)]:
-        axis_active = self._get_active_segments(axis_signal)
-        if len(axis_active) > 20:
-            # Per-axis windowed FFT (optional, you might already have it)
-            # features.update(self._extract_windowed_fft(axis_active, axis_name, fs))
-            # MFCC and Multitaper
-            features.update(self._extract_mfcc_features(axis_active, axis_name, fs))
-            features.update(self._extract_multitaper_features(axis_active, axis_name, fs))
+# 5. Output
+print("\n=== Global tuning complete ===")
+if best_params:
+    print(f"Best hyperparameters: nu={best_params['nu']}, gamma={best_params['gamma']:.6f}, threshold={best_params['threshold']}")
+    print(f"  Global TAR: {best_params['TAR']:.4f}")
+    print(f"  Global FRR: {best_params['FRR']:.4f}")
+    print(f"  Global FAR: {best_params['FAR']:.4f}")
+else:
+    print("No combination met FAR limit.")
+pd.DataFrame(results, columns=['nu', 'gamma', 'threshold', 'avg_TAR', 'avg_FRR', 'avg_FAR']) \
+    .to_csv('global_tuning_results.csv', index=False)
+print("Full results saved to global_tuning_results.csv")
