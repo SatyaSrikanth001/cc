@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-LOUO hyperparameter tuning for OCSVM with 10+ users.
-- Uses Leave‑One‑User‑Out cross‑validation.
-- Imports SessionOCSVM from your train_session module (same drop_cols).
-- Searches nu, gamma (including your current best 0.00055), threshold.
-- Enforces FAR ≤ 0.5% and picks hyperparameters that maximise average TAR.
-- Saves full grid results and best parameters.
+LOUO hyperparameter tuning – expanded grid with FRR limit.
+- Uses Leave‑One‑User‑Out on 10 users.
+- Searches a wide range of nu, gamma (adaptive + fixed), threshold.
+- Enforces FAR ≤ 0.5% AND FRR ≤ 30%.
+- Selects the configuration with highest average TAR.
+- Data path: features/v2
 """
 
 import os, glob, warnings
@@ -15,28 +15,35 @@ from sklearn.svm import OneClassSVM
 from sklearn.preprocessing import StandardScaler
 
 # **** IMPORT YOUR EXISTING CLASS ****
-# Replace 'train_session' with the actual name of your training script (without .py)
 from train_session import SessionOCSVM
 
 warnings.filterwarnings('ignore')
 
 # ======================= CONFIGURATION =======================
-DATA_DIR = "./features"                     # folder with all user CSVs
+DATA_DIR = "./features/v2"                # <-- UPDATED PATH
 TRAIN_PATTERN = "*_training_sessions.csv"
-TEST_PATTERN = "*_testing_sessions.csv"     # your files use "testing"
+TEST_PATTERN = "*_testing_sessions.csv"
 
-# Use all available users (set this to the exact number if you want a subset)
-N_USERS = 10                                # change to the number of users you have
+N_USERS = 10                              # set to your current number of users
 
-FAR_LIMIT = 0.005                           # 0.5% maximum acceptable FAR
+FAR_LIMIT = 0.005                         # 0.5% max FAR
+FRR_LIMIT = 0.30                          # max 30% FRR (rejections)
 
-# Hyperparameter search grid
-NU_VALUES = [0.01, 0.02, 0.05, 0.1, 0.2, 0.3]
-THRESHOLD_VALUES = [-0.3, -0.2, -0.1, 0.0, 0.1, 0.2]
+# ---- Expanded hyperparameter grid ----
+NU_VALUES = [
+    0.001, 0.005, 0.01, 0.02, 0.05, 0.1,
+    0.15, 0.2, 0.25, 0.3, 0.4, 0.5
+]
 
-# Gamma candidates: your current best + adaptive scaling (multiplier / n_features)
+THRESHOLD_VALUES = [
+    -0.5, -0.4, -0.3, -0.2, -0.1, 0.0, 0.1, 0.2, 0.3, 0.5
+]
+
+# Gamma: your current best value + a wide range of adaptive multipliers
 FIXED_GAMMA = 0.00055
-GAMMA_MULTIPLIERS = [0.1, 0.5, 1.0, 2.0, 5.0]
+GAMMA_MULTIPLIERS = [
+    0.01, 0.05, 0.1, 0.3, 0.5, 0.7, 1.0, 2.0, 3.0, 5.0
+]
 # =============================================================
 
 # 1. Identify users
@@ -44,11 +51,11 @@ train_files = sorted(glob.glob(os.path.join(DATA_DIR, TRAIN_PATTERN)))
 all_users = [os.path.basename(f).replace("_training_sessions.csv", "") for f in train_files]
 
 if len(all_users) < N_USERS:
-    raise ValueError(f"Only {len(all_users)} users found, but N_USERS = {N_USERS}. Reduce N_USERS or add more data.")
+    raise ValueError(f"Only {len(all_users)} users found, but N_USERS = {N_USERS}. Check DATA_DIR or reduce N_USERS.")
 users = all_users[:N_USERS]
 print(f"Users ({len(users)}): {users}")
 
-# 2. Pre‑load data for all users (features are selected by the class's drop_cols)
+# 2. Pre‑load data for all users (features selected by drop_cols in SessionOCSVM)
 user_data = {}
 feature_count = None
 
@@ -69,9 +76,9 @@ for user in users:
 n_features = feature_count
 print(f"Number of features (from drop_cols): {n_features}")
 
-# 3. Build gamma candidates
+# 3. Build gamma candidates (adaptive + fixed)
 gamma_candidates = [FIXED_GAMMA] + [mult / n_features for mult in GAMMA_MULTIPLIERS]
-gamma_candidates = sorted(set(gamma_candidates))   # remove duplicates
+gamma_candidates = sorted(set(gamma_candidates))
 print(f"Gamma candidates: {[f'{g:.6f}' for g in gamma_candidates]}")
 
 # 4. Leave‑One‑User‑Out search
@@ -124,8 +131,8 @@ for nu in NU_VALUES:
             avg_tar = np.mean(fold_tars)
             results.append((nu, gamma, thr, avg_tar, avg_frr, avg_far))
 
-            # Keep best that satisfies FAR limit
-            if avg_far <= FAR_LIMIT and avg_tar > best_tar:
+            # Keep best that satisfies BOTH limits
+            if avg_far <= FAR_LIMIT and avg_frr <= FRR_LIMIT and avg_tar > best_tar:
                 best_tar = avg_tar
                 best_params = {
                     "nu": nu,
@@ -142,7 +149,7 @@ print("   LEAVE-ONE-USER-OUT TUNING COMPLETE")
 print("=" * 60)
 
 if best_params is not None:
-    print(f"Best hyperparameters (FAR ≤ {FAR_LIMIT}):")
+    print(f"Best hyperparameters (FAR ≤ {FAR_LIMIT}, FRR ≤ {FRR_LIMIT}):")
     print(f"  nu        = {best_params['nu']}")
     print(f"  gamma     = {best_params['gamma']:.6f}")
     print(f"  threshold = {best_params['threshold']}")
@@ -150,13 +157,13 @@ if best_params is not None:
     print(f"  Average FRR         = {best_params['FRR']:.4f}")
     print(f"  Average FAR         = {best_params['FAR']:.4f}")
 else:
-    print("No hyperparameter combination met the FAR limit.")
-    print("Consider relaxing FAR_LIMIT or expanding the search grid.")
+    print("No hyperparameter combination met both FAR and FRR limits.")
+    print("Try relaxing limits or expanding the grid further.")
 
 # Save full grid results
 results_df = pd.DataFrame(
     results,
     columns=["nu", "gamma", "threshold", "avg_TAR", "avg_FRR", "avg_FAR"]
 )
-results_df.to_csv("louo_tuning_results.csv", index=False)
-print("\nFull grid results saved to 'louo_tuning_results.csv'")
+results_df.to_csv("louo_tuning_expanded_results.csv", index=False)
+print("\nFull grid results saved to 'louo_tuning_expanded_results.csv'")
