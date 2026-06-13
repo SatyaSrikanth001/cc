@@ -1,0 +1,29 @@
+File 2: train_session.py
+Purpose
+Provides the SessionOCSVM class that loads feature CSVs, selects features via the drop_cols list, scales the data, trains a One‑Class SVM, and evaluates performance (FAR, FRR, TAR, accuracy).
+
+The script also contains a main() function that iterates over a list of users, trains a model for each, and reports global metrics.
+
+The feature set is controlled by the drop_cols list inside load_and_prepare_data – any column not listed is used as a feature. The team modifies this list manually to experiment with different feature combinations.
+
+Hyperparameters (nu, gamma, threshold) were previously hardcoded and have now been tuned (currently set to nu=0.2, gamma=0.00055, threshold=-0.3).
+
+
+Explanation
+SessionOCSVM is the core class.
+
+load_and_prepare_data: reads the train/test CSV, identifies the label column, normalises it, selects features by excluding drop_cols, and returns numpy arrays.
+
+train: scales with StandardScaler and fits an OneClassSVM with the tuned parameters.
+
+evaluate: scales test data, computes decision scores, applies the threshold, and returns metrics.
+
+plot_score_scatter and save: utility functions for visualisation and model persistence.
+
+main(): loops over the user list, trains and evaluates per user, aggregates global metrics, and produces a global scatter plot.
+
+The drop_cols list is the primary manual feature selection interface. To use a feature, it must not be in drop_cols.
+
+The hyperparameters nu=0.2, gamma=0.00055, threshold=-0.3 are the ones found to be optimal on the current 3‑user test (and will be re‑tuned with more users).
+
+END OF train_session.py
