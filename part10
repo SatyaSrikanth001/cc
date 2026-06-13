@@ -1,0 +1,158 @@
+PART 10 : TODO
+Immediate Next Tasks
+Run LOUO tuning on the 10‑user dataset
+
+Execute tune_louo_expanded.py with DATA_DIR = "./features/v2" and N_USERS = 10.
+
+Wait for the grid search to complete (expected a few hours).
+
+Note the best hyperparameters (nu, gamma, threshold) that satisfy FAR ≤ 0.5 % and FRR ≤ 30 %.
+
+Apply the best hyperparameters to train_session.py
+
+Replace the hardcoded nu=0.2, gamma=0.00055, threshold=-0.3 with the values found by the LOUO search.
+
+Re‑run the full training on all available users and record the new global TAR, FAR, FRR.
+
+Finalise the feature set
+
+Compare the lead’s hand‑picked set (~100 features) with the top‑K features from the consensus ranking (test K = 30, 50, 70, 90, 100).
+
+For each candidate feature list, run the LOUO tuning script to find the maximal achievable TAR under the same constraints.
+
+Select the feature set that yields the highest TAR.
+
+Lock the drop_cols list accordingly.
+
+Uncomment already‑implemented but unused features
+
+In extract_session_features, uncomment:
+
+features.update(self.extract_fused_touch_sensor_features(session)) (pitch/roll)
+
+features.update(self.extract_jerk_smoothness_features(session)) (jerk smoothness)
+
+Regenerate CSVs, re‑run tuning, and measure the TAR improvement.
+
+Implement richer aggregation of spectral features
+
+Modify _extract_windowed_fft, _extract_mfcc_features, and _extract_multitaper_features to also return std, skew, p5, p95 for every descriptor.
+
+Update the default‑zero dictionaries (_all_fft_defaults, and the early‑return dicts in other methods) to include the new keys.
+
+Regenerate CSVs, tune, evaluate.
+
+Add high‑frequency band energy
+
+In _extract_windowed_fft and _extract_multitaper_features, add a band freqs >= 5 Hz and compute its energy.
+
+Add the new feature key to the defaults.
+
+Regenerate, tune, evaluate.
+
+Add sample entropy features
+
+Implement the _sample_entropy method as discussed.
+
+Call it for each sensor axis (acc_x, acc_y, acc_z, gyro_x, gyro_y, gyro_z) and their magnitudes.
+
+Add the new keys to the default dictionaries.
+
+Regenerate, tune, evaluate.
+
+Add spectral coherence features
+
+Implement _extract_coherence_features using scipy.signal.coherence for acc‑gyro axis pairs.
+
+Integrate into extract_fft_features (or as a standalone call in extract_session_features).
+
+Add default keys.
+
+Regenerate, tune, evaluate.
+
+Add per‑gesture statistics (separate taps vs. swipes)
+
+If the gesture_type field is reliable, split touches into taps and swipes in extract_touch_features.
+
+Compute the same duration/interval/velocity features separately for each gesture type.
+
+Add keys like tap_duration_mean, swipe_duration_mean, etc.
+
+Regenerate, tune, evaluate.
+
+Standardise imputation across all scripts
+
+Replace np.nan_to_num in train_session.py with median imputation (using the training data’s median) to match the Phase 1 and tuning scripts.
+
+Ensure all scripts consistently use median imputation.
+
+Pending Files / Scripts to Create or Finalise
+grid_search_candidate.py – A script that, given a CSV of feature names, runs the full OCSVM grid search (nu, gamma, threshold, scaler) on the 13 dev users via LOUO, and reports the best TAR.
+Status: Described but not yet written. Can be adapted from tune_louo_expanded.py.
+
+add_swipe_geometry.py (or integration into feature_creation_session.py) – The _extract_swipe_geometry method is already added to the class; ensure it is called and the default keys are present.
+
+tune_louo_expanded.py – Already written, ready to run.
+
+phase4_stability.py (optional) – Script to split dev users into two random groups, recompute consensus, and measure top‑K overlap.
+Status: Not yet written; low priority.
+
+final_evaluation.py – Script that takes the locked feature set and best hyperparameters, trains per‑user models on the 13 dev users (or all available), and evaluates on a completely held‑out set of 4 users (if available) to report final unbiased metrics.
+Status: Not yet written.
+
+models/ directory – Already used by train_session.py to save models; ensure it is created if not present.
+
+requirements.txt – Needs to be created at the project root containing all dependencies (as listed in Part 3).
+
+Improvements Under Consideration
+Improvement	Expected Impact
+Richer spectral aggregation	+4‑8 % TAR
+Sample entropy	+3‑5 % TAR
+Per‑gesture statistics	+3‑5 % TAR
+Spectral coherence	+2‑4 % TAR
+High‑frequency band	+1‑2 % TAR
+Uncomment orientation & jerk features	+2‑4 % TAR combined
+RobustScaler trial	Possible further stabilisation
+Phase 4 stability analysis	Publication‑grade confidence
+The cumulative effect of implementing all feature improvements and re‑tuning could push TAR well beyond 90 %.
+
+Research Ideas
+Investigate alternative one‑class models: Isolation Forest, Deep SVDD (Deep One‑Class Classification), or autoencoders if more data becomes available.
+
+Explore temporal fusion: Instead of aggregating windowed features by simple statistics, consider using a sequence model (e.g., 1D CNN or LSTM) on the windowed feature sequences to capture temporal dynamics more directly. This would require a significantly larger dataset.
+
+Active learning for impostor detection: Use the confidence scores of the OCSVM to selectively request labels for ambiguous sessions, gradually improving the model in deployment.
+
+Device‑invariant features: Test whether features normalised by device‑specific characteristics (screen size, sensor range) generalise across different phone models.
+
+Explainability: Use SHAP values on the final OCSVM (via kernel SHAP or similar) to explain individual predictions to users or auditors.
+
+Deployment Plans
+Model export: The current pipeline already saves {user}_ocsvm.pkl and {user}_scaler.pkl using joblib. These can be loaded in a lightweight inference service.
+
+Feature extraction on‑device: The SessionLevelFeatureExtractor logic can be ported to Java/Kotlin (Android) or Swift (iOS) to extract features directly on the mobile device, sending only the feature vector to the authentication server.
+
+Real‑time scoring: The server loads the user‑specific model and scaler, scales the incoming feature vector, and returns decision_function score. If the score ≥ threshold, the transaction is allowed.
+
+Model update: New genuine sessions can be added to the user’s training set periodically, and the model retrained (or updated via incremental SVM if available).
+
+Threshold adjustment: The system can expose a configuration parameter to adjust the threshold based on risk appetite (lower threshold → more security but higher FRR).
+
+Immediate Action Items for the Next Developer
+Run tune_louo_expanded.py on the 10‑user dataset in features/v2/.
+
+Apply the resulting hyperparameters to train_session.py.
+
+Regenerate CSVs after uncommenting orientation and jerk features.
+
+Implement richer aggregation for spectral features and regenerate CSVs.
+
+Run LOUO tuning after each change and document the TAR progression.
+
+Once TAR exceeds 90 %, lock the feature set and hyperparameters.
+
+Create the grid_search_candidate.py script for future feature set comparisons.
+
+Set up a held‑out evaluation set (4 users) and run final_evaluation.py for an unbiased performance report.
+
+END OF PART 10
