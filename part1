@@ -1,0 +1,152 @@
+PART 1 : PROJECT OVERVIEW
+Project Title
+Sensor‑Based Behavioural Biometric Fraud Detection for Mobile Payment Interfaces
+
+Main Objective
+Develop a system that uses gyroscope and accelerometer data collected during mobile payment sessions (PhonePe‑like interface) to automatically authenticate the legitimate user and detect fraudulent transactions.
+The core goal is to improve authentication accuracy from a baseline of ~69 % to ≥90 %, while keeping the False Acceptance Rate (FAR) below 0.5 % and the False Rejection Rate (FRR) within reasonable limits.
+
+Problem Statement
+Mobile payment apps are vulnerable to fraud. Traditional PIN‑based or password‑based authentication can be compromised. Behavioural biometrics – using how a user interacts with the device (touch, motion, navigation) – offers an additional layer of security.
+
+However, the raw sensor data is high‑dimensional (~441 hand‑crafted features) and the One‑Class SVM (OCSVM) model used is sensitive to noise, feature redundancy, and hyperparameters. The project must:
+
+Determine which of the many engineered features truly discriminate genuine users from impostors.
+
+Optimise the OCSVM hyperparameters (nu, gamma, threshold) per user.
+
+Build a pipeline that can be extended to new users while maintaining high accuracy and low error rates.
+
+Final Expected Output
+A production‑ready feature‑selection pipeline (Phases 1‑5) that, given raw CSV files, outputs a final list of the most discriminative features.
+
+A tuned per‑user OCSVM model with fixed hyperparameters that can authenticate sessions in real time.
+
+A rigorous validation framework (Leave‑One‑User‑Out) that provides honest, unbiased performance estimates.
+
+A handoff document enabling any future team to reproduce and extend the work.
+
+Current Project Status
+Feature extraction is complete: the class SessionLevelFeatureExtractor generates ~441 features (expanded with MFCC, Multitaper, per‑axis FFT, etc.).
+
+Data cleansing (Phase 1) has been implemented and refined (median imputation, Spearman correlation, etc.).
+
+Feature ranking via three independent methods (Boruta+SHAP, Fisher score, RF Leave‑One‑User‑Out) is available (Phases 2A‑2C).
+
+Consensus ranking (Phase 3) with weighted percentiles has been finalised.
+
+Hyperparameter tuning has been performed on a small set (3 users) yielding nu=0.2, gamma=0.00055, threshold=-0.3.
+
+LOUO tuning script for 10 users (with FAR and FRR limits) has been written and is ready to run.
+
+New features (MFCC, Multitaper, per‑axis FFT) have been integrated into the extraction code.
+
+Touch‑stroke geometry feature addition is documented and ready to be implemented.
+
+Validation against overfitting method has been designed.
+
+Current performance: after fixing a hardcoded threshold issue, the team observed a TAR improvement. Exact numbers on the 10‑user set are pending.
+
+High‑Level Architecture
+Data collection (not in scope) : Raw sensor and touch events are captured during user sessions.
+
+Feature extraction : SessionLevelFeatureExtractor processes each session to produce a CSV row of ~441 numeric features. This code is run offline to generate _training_sessions.csv and _testing_sessions.csv for each user.
+
+Data cleansing : Phase 1 script removes constant, missing, and highly correlated features, producing cleaned_features.csv.
+
+Feature ranking (Phases 2A‑2C) : Three independent ranking methods are applied to the 13 (or all) development users, producing three ranked lists.
+
+Consensus ranking : Phase 3 merges the rankings using a weighted percentile average.
+
+K‑selection / hyperparameter tuning : Phase 5 / LOUO tuning script evaluates candidate feature sets (or iterates over K) with OCSVM, selecting the best hyperparameters (nu, gamma, threshold) that maximise TAR while respecting FAR and FRR constraints.
+
+Final model : For each user, an OCSVM is trained on their genuine sessions using the chosen feature subset and the optimal hyperparameters.
+
+Deployment : The trained model and scaler are saved and can be loaded to score new sessions in real time.
+
+Data Flow Diagram (Text Form)
+text
+Raw sensor events (JSON)
+    │
+    ▼
+SessionLevelFeatureExtractor (Python class)
+    │
+    ├─ extract_navigation_features()
+    ├─ extract_touch_features()
+    ├─ extract_acc_features()
+    ├─ extract_gyro_features()
+    ├─ extract_fft_features()      ← expanded with MFCC, multitaper, per-axis
+    ├─ ... (other feature methods)
+    │
+    ▼
+Per‑session CSV rows (all features)
+    │
+    ├─ training sessions → <user>_training_sessions.csv
+    └─ test sessions     → <user>_testing_sessions.csv
+         │
+         ▼
+    Phase 1: cleansing → cleaned_features.csv
+         │
+         ▼
+    Phases 2A‑2C: ranking → boruta_shap_ranking.csv
+                             fisher_ranking.csv
+                             rf_louo_importance.csv
+         │
+         ▼
+    Phase 3: consensus → consensus_ranking.csv
+         │
+         ▼
+    Phase 5 / LOUO tuning: hyperparameter search
+         │
+         ▼
+    Best (nu, gamma, threshold) + final feature set
+         │
+         ▼
+    Per‑user training → saved model (.pkl) & scaler (.pkl)
+         │
+         ▼
+    Real‑time authentication: score = decision_function(new_session) > threshold?
+Important Terminology
+Session: One complete interaction with the payment app, from app launch to completion (or a defined timeframe). Contains sensor events, touch events, navigation events.
+
+OCSVM (One‑Class SVM): A support vector machine that learns a boundary around a single class (genuine samples). Any sample falling outside the boundary is considered an outlier (fraud).
+
+RBF kernel: Radial Basis Function kernel used in OCSVM; it maps data into a higher‑dimensional space to find a non‑linear boundary.
+
+nu: Upper bound on the fraction of training errors and lower bound on the fraction of support vectors. Controls the tightness of the boundary.
+
+gamma: Kernel coefficient for RBF. Determines the influence of a single training sample. Larger gamma → more complex boundary.
+
+threshold: Decision score above which a sample is classified as genuine. Usually 0, but can be tuned.
+
+FRR (False Rejection Rate): Proportion of genuine sessions incorrectly classified as fraud.
+
+FAR (False Acceptance Rate): Proportion of impostor sessions incorrectly classified as genuine.
+
+TAR (True Acceptance Rate): 1 – FRR.
+
+HTER (Half Total Error Rate): (FRR + FAR) / 2.
+
+LOUO (Leave‑One‑User‑Out): A cross‑validation strategy where each user is used once as the test set while all other users form the training set.
+
+Boruta: A wrapper feature‑selection algorithm that uses random forest to identify all relevant features.
+
+SHAP: SHapley Additive exPlanations – a game‑theoretic method to explain the output of machine learning models; used here to rank features after Boruta.
+
+Fisher Score: Ratio of between‑class variance to within‑class variance. Measures how well a feature separates different users.
+
+RF LOUO Importance: Feature importance derived from a Random Forest trained on other users’ genuine vs. impostor data.
+
+Consensus ranking: Aggregation of multiple feature rankings (weighted average of percentiles).
+
+drop_cols: A list in the training script that defines which features are excluded from the model.
+
+HMOG: Hand Movement, Orientation, and Grasp – a set of behavioural features extracted during touch events.
+
+MFCC: Mel‑Frequency Cepstral Coefficients – a representation of the short‑term power spectrum, commonly used in audio but adapted for motion signals.
+
+Multitaper: A spectral estimation method that uses multiple orthogonal tapers to reduce variance.
+
+END OF PART 1
+
+Please reply "CONTINUE" and I will generate PART 2 : DATASET DETAILS.
