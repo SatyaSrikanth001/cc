@@ -1,0 +1,292 @@
+PART 5 : FEATURE ENGINEERING
+Overview
+All features are extracted from raw sensor and interaction events inside the SessionLevelFeatureExtractor class. The raw data is provided as a Python dictionary (session) containing:
+
+navigation_events – list of screen transitions with timestamps and screen names.
+
+touch_events – list of touch‑down/up pairs, coordinates, gesture types.
+
+sensor_events – list of accelerometer and gyroscope readings with timestamps.
+
+device_info – screen width and height for normalisation.
+
+The extraction methods produce a flat dictionary of numerical features per session.
+The full feature pool initially contained ~441 features; after expansions (per‑axis FFT, MFCC, multitaper, swipe geometry, etc.) the total exceeds 500 features.
+
+Below, features are grouped by category, with formulas where applicable.
+
+1. Navigation Features (6 features)
+Method: extract_navigation_features
+
+Input: navigation_events list.
+
+Output: 6 numerical features.
+
+Feature	Formula / Description
+nav_total_screens	Number of screen transitions (len(nav))
+nav_total_duration	Total session time from first to last navigation timestamp (ms).
+nav_avg_time_per_screen	Mean of inter‑screen durations.
+nav_flow_deviation	Count of screens that do not follow the expected flow (Start Screen → Register → …).
+nav_back_navigation_count	Number of times the user navigated backwards in the expected flow.
+nav_unique_screens	Number of distinct screens visited.
+Why useful: Users have consistent navigation habits; impostors deviate.
+
+2. Touch Features (~25 features, expanded with swipe geometry)
+Method: extract_touch_features + _extract_swipe_geometry
+
+Input: touch_events list, device_info for screen dimensions.
+
+Output features (basic touch dynamics):
+
+touch_count, touch_tap_ratio
+
+Durations: touch_duration_mean, _std, _p5, _p95, _iqr
+
+Inter‑touch intervals: touch_interval_mean, _std, _p5, _p95, _iqr
+
+Velocities (normalised): touch_velocity_mean, _std, _p5, _p95, _iqr
+
+Trigraph flight times: trigraph_flight_mean, _std, _p5, _p95, _iqr
+
+Rhythm variance: trigraph_rhythm_variance_mean, _std
+
+Normalisation: Coordinates are divided by screen width/height.
+Velocity formula:
+v_i = sqrt( (x_{i+1} - x_i)^2 + (y_{i+1} - y_i)^2 ) / Δt, where Δt is the time between touch‑up of event i and touch‑down of event i+1.
+
+Swipe geometry (new):
+
+swipe_angle_mean, _std – mean and std of arctan2(dy, dx)
+
+swipe_path_mean, _std – direct distance between touch‑down and touch‑up (normalised)
+
+swipe_straightness_mean – set to 1.0 in absence of raw touch‑move points
+
+Why useful: Touch behaviour is highly individual – pressure, speed, rhythm, and swipe shape are biometric signatures.
+
+3. Accelerometer Features (basic, ~30 features)
+Method: extract_acc_features
+
+Input: sensor_events → accelerometer readings per axis.
+
+Calculates magnitude mag = sqrt(ax² + ay² + az²)
+
+Extracts statistics for each axis (x, y, z) and for the magnitude.
+
+Examples:
+
+acc_magnitude_mean, _std, _skew, _kurtosis
+
+acc_x_mean, _std, _skew, _kurtosis, _p5, _p50, _p95, _iqr
+
+acc_jitter – mean absolute first difference of magnitude
+
+acc_magnitude_jerk_mean, _std, _p5, _p95, _iqr (jerk is diff(mag))
+
+Why useful: Captures device motion intensity, stability, and fine motor control.
+
+4. Accelerometer Features – Magnitude Windowing (~80 features)
+Method: extract_acc_features_mag_window
+
+Process:
+
+Low‑pass filter (Butterworth, 3rd order, cutoff=min(20, fs*0.4)).
+
+Remove gravity using uniform filter (size = 5×fs).
+
+Compute linear acceleration and magnitude.
+
+Slide 5‑second windows with 50% overlap.
+
+Within each window, compute for each axis (x, y, z, mag):
+
+mean, std, skew, kurtosis, p5, p50, p95, iqr
+
+energy = sum(signal²)/N
+
+RMS = sqrt(mean(signal²))
+
+jerk mean, std, p95
+
+Also compute window‑level correlations (xy_corr, xz_corr, yz_corr) and SMA (Signal Magnitude Area) = sum(|wx|+|wy|+|wz|)/N.
+
+Aggregate across windows by taking mean and std of each per‑window descriptor.
+
+Final feature names: acc_x_mean_mean, acc_x_mean_std, …, acc_yz_corr_mean, acc_yz_corr_std.
+
+Why useful: Captures temporal variability of motion patterns.
+
+5. Gyroscope Features (~35 features, including wavelet)
+Method: extract_gyro_features
+
+Computes magnitude and per‑axis statistics similar to basic acc features.
+
+Wavelet decomposition (db4, level 1): For each gyro axis, extracts:
+
+wavelet_A_mean, _std, _energy, _max
+
+wavelet_D1_mean, _std, _energy, _max
+
+This adds ~24 features.
+
+Why useful: Rotational motion is complementary to linear motion; wavelets capture transient events.
+
+6. Touch‑Aligned Sensor Features (~30 features)
+Method: extract_touch_sensor_features
+
+For each touch, windows ±100 ms around touch‑down.
+
+Collects accelerometer and gyroscope values in those windows.
+
+Computes statistics (mean, std, variance, p05, p95, iqr) for each axis and for the magnitude, as well as axis correlations (touch_acc_corr_xy, etc.).
+
+Why useful: Isolates sensor behaviour directly during touch interaction.
+
+7. Fused Touch‑Sensor Features (pitch/roll, ~15 features)
+Method: extract_fused_touch_sensor_features
+
+Computes pitch and roll from accelerometer:
+pitch = arctan(-ax / sqrt(ay² + az²))
+roll = arctan(ay / az)
+
+For each touch window (±100 ms), extracts mean/std of pitch, roll, gyro magnitude, and ratios (std/mean).
+
+Then computes digraph (i→i+1) and trigraph (i→i+2) differences and aggregates mean/std.
+
+Why useful: Hand grip orientation during touches is user‑specific.
+
+8. HMOG (Hand Movement, Orientation, Grasp) Features (~120 features)
+Method: extract_hmog_acc_gyro and extract_long_acc_gyro
+
+For each touch event, windows before/during/after touch.
+
+Extracts per‑axis and magnitude: mean during touch, std, net change, max change, time‑to‑peak, stability time, and STFT features (energy, entropy, peak frequency) from the surrounding ±200 ms window.
+
+Example: touch_HMOG_acc_x_mean, touch_HMOG_gyro_mag_stft_energy.
+
+Why useful: Core behavioural biometrics from the HMOG paper (Sitová et al. 2016). Captures micro‑movements during interaction.
+
+9. Full‑Session FFT Features (Welch PSD, ~7 per signal → 56 total)
+Method: _extract_windowed_fft
+
+Process:
+
+Slide 2‑second Hamming windows with 50% overlap on the active signal.
+Compute Welch PSD (nperseg=32, spectrum scaling).
+For each window, extract:
+Peak frequency: frequency bin with maximum power.
+Spectral energy: sum of power.
+Spectral entropy: -sum(prob * log(prob)) / log(len(prob)) where prob = power / sum(power).
+Spectral centroid: sum(f * power) / sum(power).
+Spectral medoid: frequency where cumulative energy reaches 50%.
+Band energy low (0.5–2 Hz) and mid (2–5 Hz).
+Aggregate across windows by taking the mean of each descriptor.
+Applied to: acc_mag, gyro_mag and each axis (acc_x, acc_y, acc_z, gyro_x, gyro_y, gyro_z) → 8 signals.
+
+Feature names: acc_fft_peak_freq, acc_x_fft_spectral_energy, gyro_z_fft_band_mid_2_5hz, etc.
+
+Why useful: Frequency‑domain motion patterns (rhythm, vibration) are discriminative.
+
+10. MFCC Features (Mel‑Frequency Cepstral Coefficients, ~18 per signal → 144 total)
+Method: _extract_mfcc_features
+
+Process:
+
+Slide windows (2 s, Hamming).
+FFT → magnitude spectrum.
+Apply 12 triangular mel‑scaled filters (adapted for 0.5 to fs/2 Hz).
+Log energies → Discrete Cosine Transform (DCT) to obtain 6 cepstral coefficients.
+Across windows, compute mean, std, and delta (first‑order temporal difference) of each coefficient.
+Feature names: acc_x_mfcc_0_mean, acc_x_mfcc_0_std, acc_x_mfcc_0_delta, …
+
+Why useful: Cepstral coefficients compactly capture the spectral envelope; widely used in speaker recognition, adapted here for motion signals. Decorrelated, robust, and highly individual.
+
+11. Multitaper Spectral Features (~7 per signal → 56 total)
+Method: _extract_multitaper_features
+
+Process:
+
+Slide windows (2 s).
+Apply 3 DPSS tapers → average periodograms (reduces variance).
+Extract the same 7 descriptors as windowed FFT (peak freq, energy, entropy, centroid, medoid, low/mid band energies).
+Aggregate by mean across windows.
+Feature names: acc_mag_mt_peak_freq, gyro_x_mt_spectral_entropy, …
+
+Why useful: More stable spectral estimates → lower intra‑user variance.
+
+12. Correlation Features
+Inter‑sensor (acc vs gyro, 6 features)
+Method: extract_inter_sensor_correlations
+
+acc_gyro_mag_corr, acc_gyro_motion_corr, acc_x_gyro_x_corr, acc_y_gyro_y_corr, acc_z_gyro_z_corr, acc_gyro_mean_axis_corr.
+
+Motion correlation uses high‑pass filtered (3rd order, cutoff 0.1 Hz) accelerometer to remove gravity.
+
+Intra‑sensor (within sensor, 6 features)
+Method: extract_intra_sensor_correlations
+
+acc_x_y_corr, acc_x_z_corr, acc_y_z_corr (same for gyro).
+
+Lag correlation (5 features)
+Method: extract_lag_correlation_features
+
+Cross‑correlation between acc and gyro magnitudes.
+
+Finds lag (in samples and ms) where correlation is maximum.
+
+acc_gyro_max_lag_corr, acc_gyro_zero_lag_corr, acc_gyro_lag_corr_diff.
+
+Touch‑motion correlations (8 features)
+Method: extract_touch_motion_correlations
+
+motion_touch_idle_corr, touch_accel_energy_ratio, gyro_touch_idle_corr, etc.
+
+Measures synchronisation between touch activity and motion.
+
+Why useful: Sensor coupling and lead‑lag relationships are hard to mimic.
+
+13. HMOG Grasp Stability (Simplified, ~24 features)
+Method: extract_hmog_grasp_stability_simplified
+
+For each touch, analyses the pre‑/during‑/post‑touch sensor windows.
+
+For each signal axis and magnitude, computes:
+
+peak_amplitude (max − pre‑touch mean)
+
+recovery_percentage (post − during) / peak_amplitude
+
+post_tap_variability (std after / std before)
+
+Aggregates by mean across touches.
+
+Feature names: hmog_stab_acc_mag_peak_amplitude, …
+
+Why useful: Quantifies how much a tap perturbs the device and how quickly the user stabilises.
+
+14. Jerk Smoothness Features (~9 features)
+Method: extract_jerk_smoothness_features
+
+Computes acceleration magnitude jerk (absolute first difference).
+
+Extracts: jerk_mean, _std, _p25, _p50, _p75, _iqr, smoothness_index (1 / mean jerk), jerk_peak_rate, jerk_high_freq_energy (FFT of jerk in 3‑8 Hz band).
+
+Why useful: Smoothness of motion is a biometric trait.
+
+15. DTW (Dynamic Time Warping) Features (~16 features)
+Method: extract_dtw_features
+
+Requires pre‑computed centroids and medoids (templates) for various sensor axes and magnitude.
+
+Computes DTW distance between the session’s time series and the templates.
+
+Feature names: acc_x_dtw_centroid, gyro_mag_dtw_medoid, …
+
+Why useful: Captures similarity of the entire motion sequence to the user’s template.
+
+Scaling and Imputation
+No scaling during feature extraction – raw numerical values are stored.
+
+Before model training, StandardScaler is fitted on the genuine training data of the user (or the LOUO training set) and applied to all features.
+
+Missing values during extraction are handled by returning zero in early‑exit defaults. In Phase 1, missing values are imputed with median. In the tuning scripts, fillna(median) is used.
