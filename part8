@@ -1,0 +1,239 @@
+PART 8 : ERRORS AND DEBUGGING
+Error 1: Feature Count Mismatch Between Training and Tuning Scripts
+Exact issue:
+When running train_session.py, the drop_cols list was configured to keep 101 features. However, the tuning script imported the same class but had a different version of drop_cols (perhaps an older branch), resulting in only 85 features being used. The hyperparameters found by the tuning script were therefore optimised for a different feature space than the one they were applied to.
+
+Symptom:
+After applying the best hyperparameters (nu=0.2, gamma=0.00055, threshold=-0.3) to the main training script, accuracy actually dropped instead of improving.
+
+Root cause:
+gamma is sensitive to the number of features. A value that works for 85 features may be completely wrong for 101 features. Additionally, the feature sets themselves were different, so the tuned hyperparameters were not transferable.
+
+Fix attempted / final solution:
+
+Ensure that the drop_cols list in train_session.py is locked before running any tuning script.
+
+The tuning script imports SessionOCSVM directly from train_session, so both scripts use exactly the same feature selection.
+
+Always run the tuning script after finalising the drop_cols list.
+
+Current status: ✅ Resolved. Both scripts now share the same class and feature set.
+
+Error 2: Hardcoded Decision Threshold
+Exact error:
+In SessionOCSVM.evaluate(), the prediction line was:
+
+python
+y_pred = np.where(scores >= 0, 1, -1)
+The threshold was hardcoded to 0, regardless of the tuned value.
+
+Symptom:
+Even after the hyperparameter tuning script selected threshold=-0.3 as optimal, the main training script continued using 0. TAR showed no improvement (or very little) after tuning because the threshold was never actually changed.
+
+Root cause:
+The evaluate method did not read the threshold from a variable; it was a literal 0 in the code.
+
+Fix applied:
+Changed to:
+
+python
+threshold = -0.3   # or set from a variable
+y_pred = np.where(scores >= threshold, 1, -1)
+Lesson: Always verify that tuned hyperparameters are actually injected into every part of the code.
+
+Current status: ✅ Resolved. The threshold is now explicitly set.
+
+Error 3: MFCC and Multitaper Methods Defined but Never Called
+Exact issue:
+The methods _extract_mfcc_features and _extract_multitaper_features were written and placed inside SessionLevelFeatureExtractor, but inside extract_fft_features, only _extract_windowed_fft was called for acc_mag and gyro_mag. The new methods were never invoked.
+
+Symptom:
+After regenerating the feature CSVs, no new columns (like acc_mag_mfcc_0_mean) appeared. The team observed no accuracy change when using the new CSVs – because the features were simply not present.
+
+Root cause:
+The code for calling the new methods was missing from extract_fft_features.
+
+Fix applied:
+Updated extract_fft_features to call:
+
+python
+features.update(self._extract_mfcc_features(acc_mag_active, 'acc_mag', fs))
+features.update(self._extract_multitaper_features(acc_mag_active, 'acc_mag', fs))
+# ... similarly for each axis
+Current status: ✅ Resolved. The extended CSVs now contain the new frequency‑domain features.
+
+Error 4: Methods Defined Inside Other Methods (Indentation)
+Exact issue:
+In the pasted code for SessionLevelFeatureExtractor, many methods were indented one level too deep, placing them inside the body of the previous method. For example, extract_touch_sensor_features appeared to be inside extract_gyro_features.
+
+Symptom:
+Running the feature extraction would raise AttributeError: 'SessionLevelFeatureExtractor' object has no attribute 'extract_touch_sensor_features' when that method was called from extract_session_features.
+
+Root cause:
+A copy‑paste or editing error introduced extra indentation.
+
+Fix applied:
+All methods were re‑indented to be direct children of the class (one 4‑space indent). This was done manually in the final corrected file.
+
+Current status: ✅ Resolved. The class structure is now correct.
+
+Error 5: Variable Name Typo e → s
+Exact error:
+Inside extract_fused_touch_sensor_features, the loop iterates over sensor_events using for s in sensor_events:, but inside the loop there was a line:
+
+python
+ts = e.get("timestamp")
+The variable e was never defined; it should have been s.
+
+Symptom:
+NameError: name 'e' is not defined when the method was called.
+
+Root cause:
+Typo during coding.
+
+Fix applied:
+Changed e to s.
+
+Current status: ✅ Resolved.
+
+Error 6: Inconsistent Key Casing – _fft_defaults vs _extract_windowed_fft
+Exact issue:
+_extract_windowed_fft returns keys like f'{prefix}_fft_band_low_0_2hz' (lowercase hz).
+The original _fft_defaults method (before correction) used f'{prefix}_fft_band_low_0_2Hz' (capital H).
+This mismatch would cause KeyError or missing columns when the early‑return path was triggered.
+
+Fix applied:
+Unified all keys to use lowercase hz. The corrected _fft_defaults now accepts a prefix argument and generates the same keys as _extract_windowed_fft.
+
+Current status: ✅ Resolved.
+
+Error 7: Incorrect Gamma Candidates in Tuning Script
+Exact error (in earlier version of tuning script):
+
+python
+gamma_candidates = [FIXED_GAMMA * mult / n_features for mult in GAMMA_MULTIPLIERS]
+This multiplied the fixed gamma by the multiplier, producing extremely small values (e.g., 0.00055 * 0.1 / 85 ≈ 6.5e-7). The desired adaptive gamma values (like mult / n_features) were never actually tested. The reported “best” gamma of 0.00055 could not have come from this list – it was probably a copy‑paste error.
+
+Fix applied:
+Changed to:
+
+python
+gamma_candidates = [FIXED_GAMMA] + [mult / n_features for mult in GAMMA_MULTIPLIERS]
+Current status: ✅ Resolved in tune_louo_expanded.py.
+
+Error 8: Global Tuning Overfits to Test Set
+Issue:
+The global tuning script (tune_global.py) trained each user on their own training data and tested on their own test data, then averaged the TAR and selected the best hyperparameters. This directly optimises on the test set.
+
+Symptom:
+The reported TAR during tuning was high, but when the same parameters were used in the main script (or on new users), performance dropped.
+
+Root cause:
+Test data was used for hyperparameter selection, violating the principle that test data must remain unseen.
+
+Fix:
+Switched to Leave‑One‑User‑Out (LOUO) tuning, where each user serves as the test set exactly once, and the hyperparameters are chosen based on cross‑validated performance.
+
+Current status: ✅ LOUO tuning is the standard method. Global tuning is only kept for rough exploration and is clearly documented as biased.
+
+Error 9: Missing Default Keys in Early‑Return Dictionaries
+Issue:
+When a session has too few touches or sensors, the extraction methods return a small default dictionary (e.g., only 5 keys). After the feature extraction was expanded (MFCC, multitaper, per‑axis, swipe geometry), the early‑return paths did not include the new keys.
+
+Symptom:
+When concatenating sessions into a single CSV, sessions that hit the early‑return path would have NaN for all the new columns. This caused column misalignment and potentially corrupted the feature matrix.
+
+Fix applied:
+Introduced _all_fft_defaults() that returns a complete dictionary with zero values for every possible feature key. The early‑return paths now use this master default dictionary. Similarly, extract_touch_features early return was updated to include all possible touch keys (including swipe geometry).
+
+Current status: ✅ Resolved. All sessions now produce a consistent column set.
+
+Error 10: fillna(0) vs fillna(median)
+Issue:
+The original training script used np.nan_to_num (which fills with 0). Zero imputation can distort distributions, especially for features like stft_entropy or gyro_std where zero is not a natural baseline.
+
+Fix applied:
+Phase 1 and the tuning scripts now use median imputation. The main train_session.py still uses np.nan_to_num for simplicity, but the tuned hyperparameters were obtained on median‑imputed data. For consistency, the main script should eventually also use median imputation.
+
+Current status: ⚠️ Partially resolved – median imputation is used in all data‑cleaning and tuning steps; the main script is noted for future update.
+
+Error 11: Bare except: in extract_long_acc_gyro
+Issue:
+The code contained a bare except: clause that would silently swallow any error, including typos or shape mismatches. This made debugging nearly impossible.
+
+Fix:
+Replaced with except Exception: and added a print statement (recommendation). In the final version, specific exceptions should be caught.
+
+Current status: ⚠️ Recommended but not yet applied in the provided code. Documented for future cleanup.
+
+Error 12: SMA and Correlations Computed Inside Axis Loop
+Issue:
+In extract_acc_features_mag_window, the SMA and the correlation coefficients (xy_corr, xz_corr, yz_corr) were computed inside the for axis_name, signal in axis_data.items(): loop. This means they were computed once for each axis (x, y, z, mag), even though the values are identical each time. Not a correctness bug, but inefficient and confusing.
+
+Fix:
+Moved the four lines outside the axis loop, so they run only once per window.
+
+Current status: ✅ Fixed in the corrected code.
+
+Error 13: DTW Template File Not Found
+Issue:
+When running SessionPipeline.run(), the script tries to load {user_id}_dtw_templates.pkl from the templates/ folder. If the file doesn't exist, it prints a warning and sets centroids, medoids = None, None. Later code raises ValueError("DTW templates not found").
+
+Symptom:
+Feature extraction fails for users without pre‑computed DTW templates.
+
+Fix:
+Ensure DTW templates are generated before running the pipeline. This is a prerequisite, not a bug.
+
+Current status: ✅ Documented as a dependency.
+
+Error 14: The “Combination Pitfall” – Two Good Subsets Decrease TAR When Merged
+Exact issue:
+The team found two independent feature subsets that each improved TAR by a few percent. When both subsets were combined (uncommented from drop_cols simultaneously), TAR decreased below the baseline.
+
+Root cause:
+The OCSVM hyperparameters were optimised for the original feature set. Adding features changes the effective dimensionality, making the old nu, gamma, and threshold sub‑optimal. Additionally, new features might be highly correlated with existing ones, introducing redundancy.
+
+Lesson:
+
+Always re‑tune hyperparameters after changing the feature set.
+
+Check for multicollinearity (Spearman correlation > 0.95) before combining subsets.
+
+Use the LOUO tuning script to evaluate each new combination honestly.
+
+Current status: ✅ Understood. The LOUO tuning script is designed to handle this automatically.
+
+Error 15: Feature count mismatch for user X
+Symptom:
+During LOUO data loading, an AssertionError is raised because one user’s training CSV has a different number of columns than the others.
+
+Possible causes:
+
+Different versions of the feature extraction code were used for different users.
+
+Some CSVs are from an older run (before MFCC/multitaper were added).
+
+Fix:
+Re‑generate all CSVs with the latest version of SessionLevelFeatureExtractor. Ensure the same drop_cols and method calls are used for every user.
+
+Current status: ✅ Resolved by regenerating CSVs from a single code version.
+
+Debugging Discussions Summary
+Throughout the project, the following debugging techniques were used or recommended:
+
+Printing feature counts (len(self.feature_columns)) to verify the correct feature set is loaded.
+
+Inspecting CSV columns after regeneration to confirm new features are present.
+
+Plotting score scatter plots per user to visually check separation of genuine and impostor.
+
+Checking validation FRR via the validate() method to detect overfitting.
+
+Saving full grid search results to CSV for inspection (instead of relying only on the printed best).
+
+Comparing global tuning vs LOUO tuning results to detect overfitting.
+
+Verifying that tuned hyperparameters are actually hardcoded in the final script before running.
+
+END OF PART 8
