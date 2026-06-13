@@ -1,0 +1,232 @@
+import pandas as pd
+import numpy as np
+from sklearn.svm import OneClassSVM
+from sklearn.preprocessing import StandardScaler
+import joblib
+import os
+import matplotlib.pyplot as plt
+from matplotlib.ticker import MultipleLocator
+
+class SessionOCSVM:
+
+    def __init__(self, user_id):
+        self.user_id = user_id
+        self.model = None
+        self.scaler = None
+        self.feature_columns = None
+
+    def load_and_prepare_data(self, train_path, test_path):
+
+        print("\n" + "=" * 60)
+        print(f" LOADING SESSION DATA FOR USER: {self.user_id}")
+        print("=" * 60)
+
+        train_df = pd.read_csv(train_path)
+        test_df = pd.read_csv(test_path)
+
+        print(f"\nTrain shape: {train_df.shape}")
+        print(f"Test shape: {test_df.shape}")
+
+        possible_labels = ['session_label', 'label', 'test_type']
+        label_col = None
+        for col in possible_labels:
+            if col in test_df.columns:
+                label_col = col
+                break
+        if label_col is None:
+            raise Exception("❌ No label column found. Expected one of: session_label / label / test_type")
+
+        print(f"\nUsing label column: {label_col}")
+
+        def normalize(x):
+            x = str(x).lower()
+            return 'genuine' if 'genuine' in x else 'impostor'
+
+        test_df['__label__'] = test_df[label_col].apply(normalize)
+
+        print("\nTest label distribution:")
+        print(test_df['__label__'].value_counts())
+
+        # ======================================================
+        # FEATURE SELECTION via drop_cols
+        # Add any column name to this list to EXCLUDE it.
+        # The model uses all columns NOT in this list.
+        # ======================================================
+        drop_cols = [
+            'session_id',
+            'impostor_user_id',
+            label_col,
+            '__label__',
+            # Example features that are manually excluded/included:
+            # 'nav_total_screens',
+            # 'nav_total_duration',
+            # ...
+            # Add or comment out lines to change the feature set.
+        ]
+
+        # Optionally extend drop_cols with features you want to exclude
+        # (this was previously used to experiment with per‑axis FFT)
+        # drop_cols.extend([
+        #     'gyro_y_fft_peak_freq',
+        #     ...
+        # ])
+
+        self.feature_columns = [c for c in train_df.columns if c not in drop_cols]
+        print(f"Feature count: {len(self.feature_columns)}")
+
+        X_train = train_df[self.feature_columns].values
+        X_test = test_df[self.feature_columns].values
+        y_test = np.where(test_df['__label__'] == 'genuine', 1, -1)
+
+        # Handle NaN (basic zero imputation – later replaced by median in tuning scripts)
+        X_train = np.nan_to_num(X_train)
+        X_test = np.nan_to_num(X_test)
+
+        return X_train, X_test, y_test, train_df, test_df
+
+    def train(self, X_train):
+        print("\nTraining OCSVM...")
+        self.scaler = StandardScaler()
+        X_train_scaled = self.scaler.fit_transform(X_train)
+
+        # Tuned hyperparameters (obtained via LOUO search)
+        self.model = OneClassSVM(
+            kernel='rbf',
+            nu=0.2,            # previously 0.05
+            gamma=0.00055      # unchanged
+        )
+        self.model.fit(X_train_scaled)
+        print(" Training complete")
+
+    def evaluate(self, X_test, y_test):
+        print("\nEvaluating...")
+        X_test_scaled = self.scaler.transform(X_test)
+        scores = self.model.decision_function(X_test_scaled)
+
+        # Use the tuned threshold (previously hardcoded to 0)
+        threshold = -0.3
+        y_pred = np.where(scores >= threshold, 1, -1)
+
+        genuine = y_test == 1
+        impostor = y_test == -1
+        frr = np.sum((scores[genuine] < threshold)) / np.sum(genuine)
+        far = np.sum((scores[impostor] >= threshold)) / np.sum(impostor)
+        tar = 1 - frr
+        acc = np.mean(y_pred == y_test)
+
+        print("\n SESSION-LEVEL RESULTS")
+        print(f"FAR: {far:.4f}")
+        print(f"FRR: {frr:.4f}")
+        print(f"TAR: {tar:.4f}")
+        print(f"Accuracy: {acc:.4f}")
+
+        return scores, frr, far, tar
+
+    def plot_score_scatter(self, scores, y_test, save_dir="plots"):
+        os.makedirs(save_dir, exist_ok=True)
+        plt.figure(figsize=(10, 5))
+        indices = np.arange(len(scores))
+        genuine_idx = y_test == 1
+        impostor_idx = y_test == -1
+        plt.scatter(indices[genuine_idx], scores[genuine_idx], color='green', label='Genuine', alpha=0.7)
+        plt.scatter(indices[impostor_idx], scores[impostor_idx], color='red', label='Impostor', alpha=0.7)
+        plt.axhline(0, color='black', linestyle='--', label='Threshold = 0')
+        plt.gca().yaxis.set_major_locator(MultipleLocator(0.01))
+        plt.ylim(-1, 1)
+        plt.title(f"Score Scatter Plot - User {self.user_id}")
+        plt.xlabel("Sample Index")
+        plt.ylabel("Decision Score")
+        plt.legend()
+        plt.grid(alpha=0.3)
+        save_path = os.path.join(save_dir, f"{self.user_id}_scatter.png")
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"■ Saved plot: {save_path}")
+
+    def save(self):
+        os.makedirs("models", exist_ok=True)
+        joblib.dump(self.model, f"models/{self.user_id}_ocsvm.pkl")
+        joblib.dump(self.scaler, f"models/{self.user_id}_scaler.pkl")
+        print("\n■ Model saved")
+
+    # Optional overfitting check (not yet integrated into main loop)
+    def validate(self, X_train_full, val_ratio=0.2):
+        from sklearn.model_selection import train_test_split
+        X_tr, X_val = train_test_split(X_train_full, test_size=val_ratio, random_state=42)
+        scaler = StandardScaler()
+        X_tr_scaled = scaler.fit_transform(X_tr)
+        X_val_scaled = scaler.transform(X_val)
+        temp_ocsvm = OneClassSVM(kernel='rbf', nu=self.model.nu, gamma=self.model.gamma)
+        temp_ocsvm.fit(X_tr_scaled)
+        val_scores = temp_ocsvm.decision_function(X_val_scaled)
+        val_pred = (val_scores >= 0).astype(int)
+        val_frr = 1.0 - val_pred.mean()
+        print(f"\n[VALIDATION] Val FRR (genuine only): {val_frr:.4f}")
+        if val_frr > 0.15:
+            print("⚠️  WARNING: High validation FRR. Model may be overfitting.")
+        else:
+            print("✓ Validation FRR is acceptable.")
+        return val_frr
+
+
+def main():
+    USER_ID = [
+        'samanth', 'vinay', 'reddy123', 'harshit', 'Bhargav128',
+        'Nikitha18', 'Pranav', 'surya_mangam30', 'gunja', 'skyy',
+        'uday', 'visha117', 'tiwari', 'Pratik', 'amishp', 'Diana', 'sarya'
+    ]
+
+    global_FRR = 0
+    global_FAR = 0
+    global_TAR = 0
+    all_scores = []
+    all_labels = []
+
+    for i in USER_ID:
+        TRAIN = f"./features/{i}_training_sessions.csv"
+        TEST = f"./features/{i}_testing_sessions.csv"
+        model = SessionOCSVM(i)
+        X_train, X_test, y_test, train_df, test_df = model.load_and_prepare_data(TRAIN, TEST)
+        model.train(X_train)
+        scores, frr, far, tar = model.evaluate(X_test, y_test)
+        all_scores.extend(scores)
+        all_labels.extend(y_test)
+        global_FRR += frr
+        global_FAR += far
+        global_TAR += tar
+        model.plot_score_scatter(scores, y_test, save_dir='plots')
+        model.save()
+
+    global_FRR /= len(USER_ID)
+    global_FAR /= len(USER_ID)
+    global_TAR /= len(USER_ID)
+
+    all_scores = np.array(all_scores)
+    all_labels = np.array(all_labels)
+
+    os.makedirs("plots", exist_ok=True)
+    plt.figure(figsize=(15, 10))
+    indices = np.arange(len(all_scores))
+    genuine_idx = all_labels == 1
+    impostor_idx = all_labels == -1
+    plt.scatter(indices[genuine_idx], all_scores[genuine_idx], color='green', label='Genuine', alpha=0.5)
+    plt.scatter(indices[impostor_idx], all_scores[impostor_idx], color='red', label='Impostor', alpha=0.5)
+    plt.axhline(0, color='black', linestyle='--', label='Threshold = 0')
+    plt.gca().yaxis.set_major_locator(MultipleLocator(0.01))
+    plt.ylim(-1, 1)
+    plt.title("Global Score Scatter Plot (All Users)")
+    plt.xlabel("Sample Index")
+    plt.ylabel("Decision Score")
+    plt.legend()
+    plt.grid(alpha=0.3)
+    global_path = os.path.join("plots", "global_scatter.png")
+    plt.savefig(global_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"🟩 Saved global plot: {global_path}")
+    print(f"global_FRR:{global_FRR:.4f}")
+    print(f"global_FAR:{global_FAR:.4f}")
+    print(f"global_TAR:{global_TAR:.4f}")
+
+
+if __name__ == "__main__":
+    main()
