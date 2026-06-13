@@ -1,0 +1,249 @@
+PART 12 : EVERYTHING THE NEXT GPT MUST KNOW
+This final part is a complete, self‑contained context package. It contains all critical information, assumptions, file locations, dependencies, and warnings necessary for another AI (or human) to pick up the project immediately without access to the previous conversation.
+
+1. High‑Level Project Goal
+Build a per‑user One‑Class SVM (OCSVM) that authenticates mobile payment sessions based on gyroscope and accelerometer data extracted from a custom app. The system must:
+
+Achieve ≥90% TAR (True Acceptance Rate)
+
+Keep FAR ≤ 0.5%
+
+Keep FRR ≤ 30%
+
+Current baseline (with hand‑picked features and tuned hyperparameters) is ~75% TAR. The path to 90% is to systematically select the best feature subset and optimise OCSVM hyperparameters via cross‑validation.
+
+2. Complete Data Flow
+Raw JSON (data/new_raw/<user>.json) contains sessions with sensor_events, touch_events, navigation_events.
+
+Feature Extraction (feature_creation_session.py):
+
+SessionPipeline.run() loads a JSON, splits sessions (train/test), extracts features via SessionLevelFeatureExtractor.
+
+Produces features/v2/<user>_training_sessions.csv and <user>_testing_sessions.csv.
+
+Data Cleansing (Phase 1: phase1_cleansing.py):
+
+Combines training CSVs of 13 dev users, removes duplicates, high‑missing, low‑variance, highly correlated features (Spearman, >0.95).
+
+Outputs cleaned_features.csv (list of surviving features).
+
+Feature Ranking (Phases 2A‑2C, using the cleaned feature list):
+
+2A: Boruta + SHAP → boruta_shap_ranking.csv
+
+2B: Fisher Score → fisher_ranking.csv
+
+2C: Random Forest Leave‑One‑User‑Out → rf_louo_importance.csv
+
+Consensus (Phase 3: phase3_consensus.py):
+
+Weighted percentile average (Boruta 50%, RF 35%, Fisher 15%) → consensus_ranking.csv
+
+Hyperparameter Tuning (tune_louo_expanded.py):
+
+Leave‑One‑User‑Out cross‑validation on all available users (currently 10).
+
+Searches nu, gamma, threshold with constraints FAR≤0.5%, FRR≤30%.
+
+Outputs best parameters.
+
+Final Model (train_session.py):
+
+Uses the chosen feature set (via drop_cols) and the best hyperparameters.
+
+Trains per‑user OCSVM, evaluates, saves models.
+
+3. Critical Files & Their Purposes
+File	Purpose
+feature_creation_session.py	SessionLevelFeatureExtractor class (all feature extraction logic) and SessionPipeline (JSON→CSV). Must be imported by train_session.py and by tuning scripts.
+train_session.py	SessionOCSVM class (data loading, training, evaluation). Contains the drop_cols list that defines which features are used. main() runs on all users.
+phase1_cleansing.py	Data cleansing on dev users; outputs cleaned_features.csv.
+phase2a_boruta_shap.py	Boruta + SHAP ranking.
+phase2b_fisher.py	Fisher score ranking with visualisations.
+phase2c_rf_louo.py	RF LOUO importance.
+phase3_consensus.py	Weighted consensus aggregation.
+tune_louo_expanded.py	Current LOUO tuning script (expanded grid, FRR limit). Expects data in ./features/v2/.
+cleaned_features.csv	Output of Phase 1; input to Phases 2A‑2C.
+consensus_ranking.csv	Final ranked feature list (from Phase 3).
+final_feature_set.csv	(To be generated) The chosen feature subset.
+4. Feature Extraction Class (SessionLevelFeatureExtractor)
+Contains ~20 methods, each extracting a category of features.
+
+All methods must be direct children of the class (single indent), not nested inside others.
+
+The main aggregator is extract_session_features(). It calls all feature methods.
+
+Currently implemented and active:
+
+Navigation, Touch, Acc (basic + mag window), Gyro (basic + wavelet), Touch‑sensor, HMOG acc‑gyro (touch‑aligned with STFT), FFT (Welch windowed, per‑axis, MFCC, multitaper), inter/intra sensor correlations, lag correlation, touch‑motion correlation, HMOG grasp stability, jerk smoothness (commented out in aggregator, but method exists).
+
+Implemented but commented out in aggregator:
+
+extract_fused_touch_sensor_features (pitch/roll)
+
+extract_jerk_smoothness_features
+
+Newly added:
+
+_extract_swipe_geometry – called inside extract_touch_features.
+
+Default zero dictionaries:
+
+_all_fft_defaults() returns zeros for all signals (8 prefixes) × all descriptor types (windowed FFT, MFCC, multitaper) → ensures consistent columns even when early return is triggered.
+
+extract_touch_features early‑return dict includes all possible touch keys (including swipe geometry).
+
+All other early‑return paths should be checked for completeness.
+
+Critical helpers:
+
+_get_active_segments (keeps high‑variance parts)
+
+_estimate_sampling_rate
+
+_parse_sensors_no_interpolation
+
+lowpass_filter
+
+All numpy / scipy imports needed (see Section 6).
+
+5. Training Script (SessionOCSVM in train_session.py)
+Feature selection: Controlled by drop_cols list inside load_and_prepare_data. Any column not in drop_cols is used as a feature.
+
+Data loading: Reads CSV, finds label column (tries session_label, label, test_type), normalises to genuine/impostor, maps to 1/-1.
+
+Scaling: StandardScaler fitted on training data only.
+
+Model: OneClassSVM(kernel='rbf', nu=..., gamma=...).
+
+Evaluation: Uses a threshold (currently -0.3). FRR = fraction of genuine with score < threshold; FAR = fraction of impostor with score ≥ threshold; TAR = 1‑FRR; Accuracy = correct / total.
+
+Validation: validate() method exists (not called in main) that splits genuine data 80/20 and checks FRR on the 20% hold‑out. Use to detect overfitting.
+
+Saving: Models and scalers saved to models/ directory with joblib.
+
+6. Required Python Environment
+Python 3.8+
+
+Packages:
+
+text
+numpy, pandas, scikit-learn, xgboost, boruta, shap,
+scipy, matplotlib, seaborn, PyWavelets, dtw, joblib
+No GPU required; all CPU‑based.
+
+Install:
+
+bash
+pip install numpy pandas scikit-learn xgboost boruta shap scipy matplotlib seaborn PyWavelets dtw joblib
+dtw is the dtw package (not dtw-python).
+
+PyWavelets is imported as pywt.
+
+boruta must be >=0.3.
+
+7. Folder Structure (Current State)
+text
+project_root/
+├── data/
+│   └── new_raw/
+│       ├── harshit.json
+│       ├── samanth.json
+│       └── ... (one JSON per user)
+├── features/
+│   └── v2/
+│       ├── <user1>_training_sessions.csv
+│       ├── <user1>_testing_sessions.csv
+│       └── ... (for 10 users)
+├── feature_creation_session.py
+├── train_session.py
+├── phase1_cleansing.py
+├── phase2a_boruta_shap.py
+├── phase2b_fisher.py
+├── phase2c_rf_louo.py
+├── phase3_consensus.py
+├── tune_louo_expanded.py
+├── cleaned_features.csv
+├── consensus_ranking.csv
+├── (other generated CSVs: rankings, tuning results)
+├── models/
+├── plots/
+└── templates/          # DTW templates (pre‑computed)
+The current active data path is ./features/v2/. All tuning scripts point there (DATA_DIR = "./features/v2").
+
+8. Key Decisions and Their Rationale
+OCSVM per user: Genuine‑only training; no impostor data needed for training.
+
+RBF kernel: Non‑linear boundary required.
+
+Per‑axis + MFCC + Multitaper features: Literature proves they improve authentication; they are now integrated.
+
+LOUO tuning: Only honest way to select hyperparameters for per‑user models.
+
+Median imputation in Phase 1 and tuning scripts: More robust than zero imputation.
+
+Weighted consensus (50‑35‑15): Reflects relative importance: Boruta+SHAP > RF LOUO > Fisher.
+
+FRR limit (30%) in tuning: Prevents model from becoming too lenient just to maximise TAR.
+
+9. Known Issues & Warnings
+train_session.py still uses np.nan_to_num (zero imputation). For consistency, it should eventually use median imputation (as done in all other scripts).
+
+Global tuning script tune_global.py exists but is biased. Use only for quick exploration; never for final hyperparameter selection.
+
+drop_cols must be identical between train_session.py and the tuning script. The tuning script imports SessionOCSVM from train_session, so it uses the same drop_cols automatically. However, if you change drop_cols in train_session.py, you must re‑run the tuning script.
+
+All early‑return default dictionaries must be kept up‑to‑date when adding new features. The _all_fft_defaults() helper is the master for FFT‑related features. Other methods should have similarly comprehensive default dicts.
+
+The DTW templates must exist in the templates/ folder before feature extraction. If missing, the pipeline will abort.
+
+User list in train_session.py main() may differ from the actual users in features/v2/. Ensure the USER_ID list matches the CSV files present.
+
+10. Step‑by‑Step Plan to Continue the Project
+Run tune_louo_expanded.py with N_USERS=10 and DATA_DIR="./features/v2". This will take time but will yield reliable hyperparameters.
+
+Apply the best hyperparameters to train_session.py (replace the hardcoded nu, gamma, threshold).
+
+Uncomment extract_fused_touch_sensor_features and extract_jerk_smoothness_features in extract_session_features of the feature creation script, regenerate CSVs, and re‑run LOUO tuning to measure improvement.
+
+Implement richer aggregation of spectral features (std, skew, p5, p95) in _extract_windowed_fft, _extract_mfcc_features, _extract_multitaper_features. Update default dictionaries. Regenerate CSVs and re‑tune.
+
+Add remaining planned features (high‑frequency band, sample entropy, spectral coherence, per‑gesture statistics) one by one, each time regenerating CSVs and re‑running LOUO tuning to confirm TAR gain.
+
+Compare the lead’s hand‑picked feature set against various top‑K consensus sets (K=30,50,70,90,100) by running the full grid search for each candidate set. The candidate set evaluation script grid_search_candidate.py needs to be created (or adapt tune_louo_expanded.py to accept a feature list CSV).
+
+Lock the final feature set that achieves the highest TAR while respecting FAR and FRR limits.
+
+If possible, set aside 4 users as a final held‑out set and evaluate the locked model on them to report an unbiased final performance.
+
+11. Critical Assumptions
+The label column in test CSVs uses 0 for genuine and 1 for impostor.
+
+All training sessions are genuine.
+
+The sensor sampling rate is roughly 16 Hz (auto‑detected).
+
+The same set of features exists in all CSV files; any mismatch is handled by taking the intersection.
+
+Impostor sessions are device‑specific and should never be pooled across users (each impostor session belongs to the device/user whose CSV it appears in).
+
+The project does not currently use any data from the held‑out test users during feature selection or tuning.
+
+12. Final Context for an Incoming AI
+You are joining a project that has:
+
+A fully functional feature extraction pipeline that produces >500 features per session.
+
+A proven cross‑validation hyperparameter tuning framework (LOUO) ready to run on 10 users.
+
+A systematic feature selection methodology (Phases 1‑3) that can be extended to include new features.
+
+A working OCSVM training script that can be customised via a simple drop_cols list.
+
+A clear roadmap of feature engineering additions, each backed by research papers and expected to incrementally improve TAR.
+
+A detailed record of past errors and their fixes, so you don’t repeat them.
+
+Your primary objectives are to execute the tuning on the current dataset, incrementally add the planned features, and lock the final model. All necessary code, documentation, and experiments are provided above.
+
+END OF HANDOVER DOCUMENT
