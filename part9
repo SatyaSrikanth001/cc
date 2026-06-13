@@ -1,0 +1,147 @@
+PART 9 : DECISIONS
+Why OCSVM Was Chosen
+One‑class nature of the problem: Training data contains only genuine sessions. OCSVM is designed to learn a boundary around a single class.
+
+Interpretability: The model outputs a decision score; a simple threshold determines the outcome. This is easier to explain to stakeholders than a deep neural network.
+
+Lightweight: OCSVM training and inference are fast on CPU, suitable for eventual on‑device deployment.
+
+Per‑user modelling: Each user has a unique behavioural signature. A global two‑class classifier (genuine vs. impostor) would require training on impostor data from many users, which is not always available. Per‑user OCSVM solves this elegantly.
+
+Alternatives considered:
+
+Isolation Forest: Can also model one class, but OCSVM with RBF kernel is more established for behavioural biometrics and yielded better results in preliminary tests.
+
+Autoencoder + reconstruction error: Rejected due to increased complexity and need for more data to train a robust autoencoder per user.
+
+Two‑class SVM / Random Forest: Would require a balanced dataset of genuine and impostor samples for each user, which is not available (impostor samples are limited and vary by device). Using other users’ impostor data leads to domain mismatch (different devices).
+
+Why RBF Kernel
+The genuine data distribution in the feature space is not linearly separable from impostors.
+
+RBF kernel can capture complex, non‑linear boundaries.
+
+It is the default choice in the behavioural biometrics literature (Sitová et al., Frank et al., Buriro et al.).
+
+Alternative: Linear kernel – tested initially but gave much higher FRR, indicating the boundary is non‑linear.
+
+Why Per‑User Models Instead of a Global Model
+Different users have different hand sizes, grip styles, and motor patterns. A global model would need to learn a universal “human” behaviour, which would be too broad to catch subtle impostor attempts.
+
+In real deployment, a new user would train their own model by providing a few genuine sessions.
+
+Tradeoff: Requires at least ~40 genuine sessions per user for stable training. The project assumes this is feasible.
+
+Why the Feature Selection Pipeline Was Designed in Phases
+Phase 1 (cleansing): Removes obvious garbage – constant, missing, correlated features – before any sophisticated ranking.
+
+Phases 2A‑2C (independent rankings): Three methods that capture different aspects: non‑linear interactions (Boruta+SHAP), user separability (Fisher), and discriminative power for fraud (RF LOUO). No single method is perfect; consensus gives robustness.
+
+Phase 3 (consensus): Aggregates rankings with weights reflecting their relevance to the final task.
+
+Phase 5 / LOUO tuning: Evaluates the final feature subset(s) with the actual classifier and hyperparameters, avoiding the disconnect between a ranking and model performance.
+
+Why Three Specific Ranking Methods Were Chosen
+Method	Rationale
+Boruta + SHAP	Wrapper method that finds all relevant features, even those with non‑linear relationships. SHAP gives accurate importance values based on game theory. Uses multi‑class user labels (genuine data only), which is safe (no impostor leakage).
+Fisher Score	Fast filter method; directly measures inter‑user vs. intra‑user variance, which is a core requirement for biometrics: features should be stable for a user but vary between users.
+RF LOUO Importance	Embedded method that uses the actual impostor data (from other users), giving a direct estimate of feature usefulness for fraud detection. The LOUO scheme ensures no data leakage to the target user.
+Alternatives rejected:
+
+Mutual Information: Similar to Fisher but slower; not added due to time, but could be included later.
+
+L1‑regularised Logistic Regression: Produces a sparse set but doesn’t provide a smooth ranking, making it harder to test different K values.
+
+Recursive Feature Elimination (RFE): Too computationally expensive with 400+ features.
+
+Why the Weighted Consensus with These Weights (50‑35‑15)
+Boruta‑SHAP (50%) captures non‑linear interactions and is the most sophisticated of the three; it aligns best with the OCSVM’s RBF kernel.
+
+RF LOUO (35%) directly uses impostor data, making it highly relevant to the final authentication task.
+
+Fisher (15%) provides a linear separability perspective but is the weakest predictor of final OCSVM performance, so it gets the lowest weight.
+
+Alternative considered: Equal weights (33% each) – but that would undervalue Boruta‑SHAP, which consistently identified features that performed well in final tuning.
+
+Why Percentile Averaging Instead of Raw Score Averaging
+The three methods produce scores on completely different scales (SHAP values, Fisher scores, Gini importance).
+
+Converting to percentiles normalises them to a common 0‑1 range, enabling meaningful averaging.
+
+Missing features (present in only some rankings) are assigned a neutral 0.5 rather than a punitive 0.
+
+Why Spearman Correlation in Phase 1
+Sensor features often have monotonic but non‑linear relationships.
+
+Spearman is more robust to outliers than Pearson.
+
+Retaining one of each highly correlated pair reduces redundancy without losing information.
+
+Why Median Imputation Instead of Zero
+Many behavioural features (e.g., stft_entropy, gyro_std) have distributions where zero is not a meaningful or neutral value.
+
+Median preserves the central tendency and is robust to outliers.
+
+Tradeoff: Median imputation requires computing statistics across users; zero‑imputation is simpler and is still used in the main train_session.py for quick runs. The long‑term plan is to move to median imputation throughout.
+
+Why LOUO Tuning Instead of Global (Test‑set) Tuning
+Global tuning selects hyperparameters based on the same test set used for final evaluation, leading to overfitting and inflated performance.
+
+LOUO ensures that each user’s test data is completely unseen during hyperparameter selection, giving a realistic estimate of generalisation.
+
+Lesson learned: The initial global tuning produced a high TAR that vanished when applied honestly. LOUO is mandatory for trustworthy results.
+
+Why an FRR Limit Was Added
+Real‑world payment systems cannot reject legitimate users too often (poor user experience).
+
+A 30% FRR limit ensures the model is not simply maximising TAR by accepting everyone (which would also increase FAR).
+
+The LOUO script now enforces both FAR ≤ 0.5% and FRR ≤ 30%.
+
+Why the Expanded FFT Features Were Added
+Literature (Guo et al. 2019, Sitová et al. 2016) shows that per‑axis spectral features and cepstral coefficients improve authentication.
+
+These features are cheap to compute once the FFT infrastructure is in place.
+
+MFCC and multitaper add spectral shape and stability information beyond simple energy/entropy.
+
+Tradeoff: Increases feature count from ~14 to ~250 frequency‑domain features, but the subsequent feature selection pipeline is designed to handle this.
+
+Why the Stability Analysis (Phase 4) Is Optional
+The consensus ranking itself is an ensemble of three methods, reducing the risk of overfitting to a particular user split.
+
+The LOUO evaluation in Phase 5 and the final tuning already provide practical stability estimates.
+
+Implementing Phase 4 correctly requires multiple random splits, which is computationally heavy and not essential for immediate progress.
+
+It can be added later for a publication‑grade validation.
+
+Why a Validation Split Was Added (but Not Integrated)
+The validate() method was designed as a quick overfitting check per user.
+
+It was not integrated into the main loop because the LOUO tuning already provides a robust cross‑user estimate.
+
+It remains a useful diagnostic tool for manual inspection of individual models.
+
+Future Improvements Already Discussed
+Improvement	Status
+Richer aggregation of spectral features (std, skew, percentiles)	Planned, not yet implemented. Expected +4‑8% TAR.
+Touch‑stroke geometry (swipe angle, straightness)	Implemented (swipe geometry method added).
+High‑frequency band energy (>5 Hz)	Planned.
+Sample entropy (time‑domain)	Discussed; not yet coded.
+Spectral coherence between sensors	Discussed; not yet coded.
+Per‑gesture statistics (separate taps/swipes)	Discussed; not yet coded.
+Jerk smoothness features (uncomment)	Already implemented, needs uncommenting.
+Orientation (pitch/roll) during touch	Already implemented, needs uncommenting.
+Switch to RobustScaler	Considered; to be tested in grid search.
+Replace np.nan_to_num with median imputation in main script	To do for consistency.
+Rejected Ideas
+Deep learning (LSTM, CNN) on raw sensor streams: Requires far more data and computational resources; OCSVM on engineered features is more suitable for the current dataset size.
+
+Global two‑class model: Impostor data across users is device‑specific; pooling it introduces bias.
+
+Hard feature selection (RFE): Too slow and not inherently better than the consensus ranking.
+
+Using only one ranking method: Early tests showed that different methods favoured different feature groups; a consensus was necessary to avoid bias.
+
+END OF PART 9
