@@ -1,0 +1,389 @@
+PART 7 : EXPERIMENTS
+Experiment 1: Baseline OCSVM with All Features
+Goal: Establish initial performance using the full feature set (~441 features) and default hyperparameters.
+
+Procedure:
+
+Ran train_session.py with drop_cols containing only metadata columns (all sensor features used).
+
+Used nu=0.05, gamma=0.00055, threshold=0.
+
+Evaluated on all 17 users (global average).
+
+Results:
+
+Accuracy: ~69%
+
+TAR: ~68%
+
+FAR: ~0.15% (very low)
+
+FRR: ~32%
+
+Observations:
+
+Model is too strict – many genuine sessions rejected (high FRR).
+
+FAR is excellent; the boundary is extremely tight around training data.
+
+Indicates overfitting or inadequate hyperparameters.
+
+Lesson: Default OCSVM settings do not generalise well with this feature dimensionality.
+
+Experiment 2: Manual Feature Selection via drop_cols
+Goal: Find a feature subset that improves TAR by trial-and-error.
+
+Procedure:
+
+The team manually commented/uncommented features in the drop_cols list.
+
+For each combination, ran the full training script and noted global TAR.
+
+Two subsets were found that individually improved TAR (e.g., subset A gave +2%, subset B gave +3%).
+
+When both subsets were combined, TAR decreased.
+
+Results:
+
+Individual gains disappeared when merging.
+
+Combined set performed worse than either alone.
+
+Observations:
+
+Hyperparameters were never re‑tuned for the new feature sets.
+
+The “combination pitfall” is due to fixed nu, gamma, threshold that were optimal for the old set.
+
+Lesson: Feature selection without hyperparameter re‑tuning is unreliable. Automatic tuning is required.
+
+Experiment 3: Per‑Axis FFT Features
+Goal: Add individual axis FFT features (previously only magnitude) and measure accuracy change.
+
+Procedure:
+
+Modified extract_fft_features to call _extract_windowed_fft for acc_x, acc_y, acc_z, gyro_x, gyro_y, gyro_z.
+
+Regenerated CSVs, ran manual evaluation with fixed hyperparameters.
+
+Results:
+
+No immediate TAR gain; accuracy stayed the same or slightly decreased for some users.
+
+Scatter plots showed better separation of genuine and impostor scores, but TAR didn’t reflect it.
+
+Observations:
+
+The model couldn’t exploit the new features because hyperparameters were still tuned for the old feature set.
+
+Hyperparameter tuning needed to unlock the benefit.
+
+Lesson: New features must be accompanied by a fresh hyperparameter search.
+
+Experiment 4: MFCC and Multitaper Spectral Features
+Goal: Integrate advanced frequency‑domain features (MFCC and multitaper) and evaluate.
+
+Procedure:
+
+Added methods _extract_mfcc_features and _extract_multitaper_features to the feature extractor.
+
+Initially, these methods were defined but not called inside extract_fft_features – a critical oversight.
+
+After discovering this, the extract_fft_features method was updated to call both for magnitude and each axis.
+
+CSVs were regenerated, training script rerun with fixed hyperparameters.
+
+Results:
+
+Before fixing the missing calls: no change in TAR (features weren’t present).
+
+After the fix and retraining with nu=0.2, gamma=0.00055, threshold=-0.3: TAR improved (exact amount not quantified in logs, but positive).
+
+The earlier lack of gain was due to the features not being generated.
+
+Observations:
+
+Integration mistakes can completely nullify new features.
+
+Once properly included, the extra features provided additional discriminative power.
+
+Lesson: Always verify the generated CSV columns after modifying the extractor.
+
+Experiment 5: Global Hyperparameter Tuning (Naive)
+Goal: Quickly find best nu, gamma, threshold using the same 3‑user dataset.
+
+Procedure:
+
+Used tune_global.py – trains each user on their own genuine data, tests on their own test data, and averages TAR over all users.
+
+Grid: nu in [0.01,0.02,0.05,0.1,0.2,0.3], threshold in [-0.3,-0.2,-0.1,0,0.1,0.2], gamma candidates from fixed 0.00055 and adaptive multipliers.
+
+Selected combination with highest average TAR while FAR ≤ 0.5%.
+
+Results:
+
+Best parameters: nu=0.2, gamma=0.00055, threshold=-0.3.
+
+Reported global TAR much higher than baseline (exact value not preserved, but significantly improved).
+
+However, applying these parameters back to the main script caused accuracy to drop.
+
+Observations:
+
+The global method tunes directly on the test set, causing overfitting.
+
+The parameters looked great on the 3 users used for tuning but failed to generalise.
+
+The feature count mismatch (101 vs 85) between training and tuning scripts also contributed.
+
+Lesson: Global averaging on the same test set used for selection yields optimistically biased hyperparameters. A cross‑validation approach is mandatory.
+
+Experiment 6: Leave‑One‑User‑Out (LOUO) Hyperparameter Tuning
+Goal: Obtain honest, generalisable hyperparameters via cross‑validation.
+
+Procedure:
+
+Developed tune_louo.py (later extended to tune_louo_expanded.py).
+
+For each fold, trained OCSVM on genuine data of all users except one, tested on the held‑out user.
+
+Evaluated average TAR, FRR, FAR across folds.
+
+Grid expanded to 12 nu values, 10 threshold values, and 11 gamma values (fixed 0.00055 + 10 adaptive multipliers).
+
+Constraints: FAR ≤ 0.5%, FRR ≤ 30%.
+
+Initially run on 3 users; later adapted for 10 users.
+
+Results:
+
+On the 3‑user set, the LOUO search gave nu=0.2, gamma=0.00055, threshold=-0.3 (coincidentally matching the global best for that small set, but validated honestly).
+
+On 10 users (pending execution), the script is ready and expected to produce a more robust parameter set.
+
+The LOUO average TAR is lower than the global tuning TAR, but it reflects true generalisation.
+
+Observations:
+
+With only 3 users, the LOUO estimate is noisy but still more trustworthy than global tuning.
+
+The script includes a wide range of nu values (up to 0.5) and gamma (down to 0.01×), ensuring coverage.
+
+Lesson: LOUO is the correct tuning strategy for per‑user models.
+
+Experiment 7: Hardcoded Threshold Fix
+Goal: Understand why TAR didn’t change after hyperparameter tuning.
+
+Procedure:
+
+Discovered that the evaluate() method in train_session.py used a hardcoded threshold 0 regardless of the tuned value.
+
+Corrected it to use the variable threshold (set to -0.3).
+
+Results:
+
+Immediately after fixing, TAR increased noticeably (exact values not recorded but clear improvement).
+
+The previous tuning runs were partially void because the threshold was never actually changed.
+
+Observations:
+
+A single hardcoded constant can undermine an entire tuning effort.
+
+All hyperparameters must be parameterised in the evaluation code.
+
+Lesson: Always verify that tuned parameters are actually injected into the model.
+
+Experiment 8: Feature Ranking via Boruta + SHAP (Phase 2A)
+Goal: Identify all‑relevant features using Boruta and rank them with SHAP importance.
+
+Procedure:
+
+Used 13 development users, cleaned feature set from Phase 1.
+
+Boruta (XGBoost, multi:softprob, 100 iterations) → kept Selected + Tentative features.
+
+SHAP TreeExplainer → mean absolute SHAP across all classes.
+
+Output: boruta_shap_ranking.csv with boruta_status column.
+
+Results:
+
+Boruta retained ~100‑200 features (Selected + Tentative).
+
+SHAP ranking provided a smooth ordering.
+
+Visual inspection showed top features were intuitive (HMOG, FFT, touch).
+
+Observations:
+
+Boruta removed truly noisy features, but kept many tentatives.
+
+SHAP importance aligned with domain knowledge.
+
+Lesson: Boruta + SHAP is a reliable wrapper‑based ranking method.
+
+Experiment 9: Feature Ranking via Fisher Score (Phase 2B)
+Goal: Rank features by their ability to separate users (between‑ vs within‑class variance).
+
+Procedure:
+
+Fisher score = between‑user variance / within‑user variance.
+
+Computed on 13 dev users’ genuine training data, after Phase 1 cleaning.
+
+Results:
+
+Produced fisher_ranking.csv.
+
+Top features included many touch and HMOG features.
+
+Visualization (box plots, heatmaps) confirmed strong user separation.
+
+Observations:
+
+Fisher score is purely linear and doesn’t capture interactions.
+
+It gave a different ranking than Boruta, highlighting complementary perspectives.
+
+Lesson: Multiple independent rankings are essential.
+
+Experiment 10: Feature Ranking via RF Leave‑One‑User‑Out (Phase 2C)
+Goal: Rank features using Random Forest trained on genuine vs. impostor data from other users.
+
+Procedure:
+
+For each target user, built a training set from all other users (genuine + impostor).
+
+RF with n_estimators=300, class_weight='balanced'.
+
+Averaged feature importances across folds.
+
+Results:
+
+rf_louo_importance.csv produced a ranking that often differed from Boruta and Fisher.
+
+This ranking directly measures discriminative power for fraud detection.
+
+Observations:
+
+Using impostor data makes this ranking highly relevant to the final task.
+
+The LOUO scheme ensures no data leakage.
+
+Lesson: RF LOUO is a strong embedded feature selector for this problem.
+
+Experiment 11: Consensus Ranking (Phase 3)
+Goal: Merge the three rankings into a single robust list.
+
+Procedure:
+
+Converted each ranking’s scores to percentiles.
+
+Weighted average: 50% Boruta‑SHAP, 35% RF, 15% Fisher.
+
+Missing features (not present in all three) filled with 0.5.
+
+Stability score = standard deviation of percentiles.
+
+Results:
+
+consensus_ranking.csv provides a final ordered list with trustworthiness indicators.
+
+Features with high average percentile and low std are the most reliable.
+
+Observations:
+
+The weighting reflects the relative importance of each method for the authentication task.
+
+The stability score helps identify features that are universally top‑ranked.
+
+Lesson: Weighted consensus with missing‑value neutrality is a powerful aggregation.
+
+Experiment 12: K‑Selection with Fixed Hyperparameters (Phase 5)
+Goal: Find the optimal number of consensus features using default OCSVM settings.
+
+Procedure:
+
+For K from 10 to 150, used top‑K consensus features.
+
+Trained OCSVM with nu=0.1, gamma=1/K, threshold=0.
+
+Evaluated via LOUO on 13 dev users; selected K with minimum HTER.
+
+Results:
+
+K=10 gave the best HTER, but accuracy ~70%, far below the lead’s 75% TAR with ~100 features.
+
+Larger K values performed worse under these default hyperparameters.
+
+Observations:
+
+The fixed hyperparameters penalise larger feature sets because gamma becomes too small.
+
+This experiment does not reflect the true potential of larger feature sets after tuning.
+
+Lesson: K‑selection with fixed hyperparameters is misleading; the full grid search is needed.
+
+Experiment 13: Lead’s Hand‑Picked Feature Set
+Goal: Evaluate the team lead’s manually curated set of ~97‑103 features.
+
+Procedure:
+
+The lead had previously identified a combination that gave TAR ~75% after some tuning.
+
+The exact hyperparameters used by the lead are not fully documented, but the set was tested within the team’s workflow.
+
+Not all features from the consensus top‑10 were included (some highly ranked features were excluded, and inclusion decreased TAR).
+
+Results:
+
+TAR ~75% on the test set.
+
+Attempts to add the top consensus feature (ranked #1 by Boruta and Fisher, #6 by RF) caused TAR to drop below 70% when combined with the lead’s set without re‑tuning.
+
+Observations:
+
+Interaction between features and hyperparameters is critical.
+
+The lead’s set likely already has a tuned configuration that doesn’t accommodate new features without parameter adjustment.
+
+Lesson: The final feature set must be chosen via a fair comparison of candidate sets with full hyperparameter tuning.
+
+Experiment 14: Overfitting Check via Validation Split
+Goal: Detect overfitting in per‑user models.
+
+Procedure:
+
+Added validate() method to SessionOCSVM (not yet integrated into main).
+
+Splits genuine training data 80/20, trains temporary OCSVM, measures FRR on validation.
+
+Results:
+
+Not yet executed systematically.
+
+Designed to issue a warning if validation FRR > 0.15.
+
+Observations:
+
+This is a diagnostic tool, not a tuning method.
+
+High validation FRR would suggest increasing nu or reducing features.
+
+Lesson: Simple hold‑out validation can catch overfitting early.
+
+Summary of Key Learnings
+Hyperparameters must be tuned for each feature set.
+
+LOUO cross‑validation is the only honest way to select hyperparameters.
+
+Combining good feature subsets without re‑tuning often degrades performance.
+
+Always verify that tuned parameters are actually used in the final script.
+
+Multiple ranking methods provide complementary views; consensus is more robust than any single method.
+
+Feature‑selection K‑value cannot be judged with default hyperparameters.
+
+END OF PART 7
