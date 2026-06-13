@@ -1,0 +1,100 @@
+PART 3 : ENVIRONMENT
+Operating System
+The project was developed and run on Windows (office laptop) and possibly Linux (server).
+
+No OS‑specific code is used; all scripts are OS‑agnostic Python 3.
+
+Python Version
+Python 3.8+ is recommended.
+
+The code uses f‑strings, type hints, and standard library features compatible with Python 3.8 and above.
+
+The exact version used locally is not documented, but 3.8, 3.9, or 3.10 are safe.
+
+Conda / Virtual Environment
+The team used a conda environment (typical for data science projects), but the exact environment name is not recorded.
+
+It can be recreated with the requirements.txt below, either via conda or pip.
+
+Recreate with conda (example):
+
+bash
+conda create -n sensor_auth python=3.9
+conda activate sensor_auth
+pip install -r requirements.txt
+Or using venv:
+
+bash
+python -m venv sensor_auth_env
+source sensor_auth_env/bin/activate   # Linux/Mac
+# or sensor_auth_env\Scripts\activate on Windows
+pip install -r requirements.txt
+Pip Packages / Requirements.txt
+The following packages are required to run the entire pipeline (feature extraction, all phases, tuning, training).
+This list is reconstructed from all imports observed in the provided code.
+
+text
+numpy>=1.20
+pandas>=1.3
+scikit-learn>=1.0
+xgboost>=1.5
+boruta>=0.3
+shap>=0.40
+scipy>=1.7
+matplotlib>=3.4
+seaborn>=0.11
+PyWavelets>=1.3
+dtw>=1.4
+joblib>=1.1
+Optional but used in some parts:
+
+ipython for interactive exploration
+
+jupyter for notebooks (not mandatory)
+
+Exact installation command:
+
+bash
+pip install numpy pandas scikit-learn xgboost boruta shap scipy matplotlib seaborn PyWavelets dtw joblib
+Note: boruta and shap sometimes require additional build tools on Windows. If pip install boruta fails, try:
+
+bash
+conda install -c conda-forge boruta
+CUDA / GPU
+No GPU is used or required. All machine learning (OCSVM, Random Forest, XGBoost) runs on CPU.
+
+The dataset is small enough (a few thousand samples, ~500 features) that training is fast on a modern CPU.
+
+If XGBoost detects a GPU, it might use it by default; the scripts set n_jobs=-1 for parallel CPU usage.
+
+GPU Details
+Not applicable.
+
+Installation Commands (full setup)
+Assuming a fresh Python 3.9 environment:
+
+bash
+# Create and activate environment
+conda create -n sensor_auth python=3.9 -y
+conda activate sensor_auth
+
+# Install all dependencies
+pip install numpy pandas scikit-learn xgboost boruta shap scipy matplotlib seaborn PyWavelets dtw joblib
+
+# Verify imports
+python -c "import numpy, pandas, sklearn, xgboost, boruta, shap, scipy, matplotlib, seaborn, pywt, dtw, joblib; print('All imports successful')"
+If any package fails, install it separately with conda when possible.
+
+Additional Notes
+The dtw package used is the dtw library (not dtw-python), installed via pip install dtw.
+
+For shap, version 0.40+ is recommended because it includes the TreeExplainer used in Phase 2A.
+
+The boruta package must be version ≥0.3, which supports BorutaPy with n_estimators='auto'.
+
+No specific CUDA or GPU drivers are needed.
+
+END OF PART 3
+
+Please reply "CONTINUE" and I will generate PART 4 : COMPLETE CODEBASE.
+Note: This part is extremely long – I will split it across messages if needed.
