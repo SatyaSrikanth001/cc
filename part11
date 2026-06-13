@@ -1,0 +1,120 @@
+PART 11 : CONVERSATION HISTORY
+Step 1 – Project Introduction
+Discussed: The project goal: detect fraud using gyroscope and accelerometer data on a payment interface. Baseline OCSVM accuracy 69%, aim 90%. 441 features, classes “genuine” and “fraud”. Training on genuine only.
+
+Data described: per‑user sessions (40 train, ~35 genuine test, ~25 impostor test), 17 users, each model per user.
+
+Current manual feature selection: using a drop_cols array and trial‑and‑error to test subsets.
+
+First action: Proposed systematic feature selection pipeline (Phase 1–5) based on cleansing, independent rankings, consensus, and OCSVM tuning.
+
+Step 2 – Detailed Data and Model Clarification
+Confirmed label encoding (0=genuine, 1=impostor), scaling (StandardScaler), and that OCSVM hyperparameters were fixed (nu=0.05, gamma=0.00055, threshold=0).
+
+Noted that the code for feature generation exists (SessionLevelFeatureExtractor with many defs).
+
+Key problem: Team lead’s hand‑picked set of ~100 features gave TAR ~75% but adding the top‑ranked consensus feature reduced TAR.
+
+Decision: Design a method to evaluate any feature set fairly with automatic hyperparameter tuning.
+
+Step 3 – Feature List Provided
+Full list of ~158 features (many concatenated names) was shared.
+
+Clarified that drop_cols array selects features by commenting/uncommenting.
+
+Step 4 – Hyperparameter Tuning Strategy
+Proposed LOUO (Leave‑One‑User‑Out) tuning with grid search over nu, gamma (adaptive + fixed 0.00055), threshold, using only 13 dev users.
+
+Emphasised avoiding global tuning that overfits to test set.
+
+Step 5 – Phase 1–5 Full Plan
+Outlined Phase 1: data cleansing (drop duplicates, missing, low‑variance, high‑correlation, median imputation).
+
+Phase 2A: Boruta + SHAP (multi:softprob, subsample, colsample_bytree).
+
+Phase 2B: Fisher score with full visualisation.
+
+Phase 2C: RF LOUO with class balancing and 300 trees, saving per‑fold importance.
+
+Phase 3: weighted percentile consensus (50% Boruta, 35% RF, 15% Fisher), fill missing with 0.5.
+
+Phase 5: K‑selection with default OCSVM (nu=0.1, gamma=1/K, threshold=0) – later recognised as insufficient without full tuning.
+
+Step 6 – Implementation of Phase Scripts
+Provided complete code for Phase 1 (with median imputation, Spearman correlation, saving removal logs).
+
+Provided Phase 2A (Boruta+SHAP) and Phase 2B (Fisher) scripts.
+
+Discussed issues: missing cleaned features filter in Phase 2C, need for proper gamma candidates, global tuning danger.
+
+Step 7 – Per‑Axis FFT Feature Expansion
+Added per‑axis FFT extraction (acc_x, acc_y, acc_z, gyro_x, gyro_y, gyro_z) to extract_fft_features.
+
+Initially saw no TAR gain because the features weren’t called (later corrected).
+
+Step 8 – MFCC and Multitaper Implementation
+Added _extract_mfcc_features and _extract_multitaper_features methods.
+
+Critical error: Methods were defined but never called inside extract_fft_features.
+
+After fixing the calls and regenerating CSVs, and combining with tuned hyperparameters, TAR improved.
+
+Step 9 – Global vs LOUO Tuning Scripts
+Provided tune_global.py (quick but overfits) and tune_louo.py (honest).
+
+Noted that with only 3 users, LOUO is noisy but still better than global.
+
+Step 10 – Hardcoded Threshold Fix
+Discovered that evaluate() in train_session.py used scores >= 0 regardless of the tuned threshold.
+
+After changing to threshold = -0.3, TAR increased noticeably.
+
+Step 11 – Gamma Candidate Error
+In tune_global.py, gamma candidates were computed incorrectly as FIXED_GAMMA * mult / n_features instead of mult / n_features, causing extremely small values. Fixed.
+
+Step 12 – Integration of New Features into extract_fft_features
+Updated extract_fft_features to call MFCC and Multitaper for magnitude and each axis.
+
+Fixed _fft_defaults to accept prefix and return proper keys for all signals.
+
+Step 13 – Swipe Geometry Feature Addition
+Added _extract_swipe_geometry method and integrated into extract_touch_features.
+
+Updated default keys to include swipe_angle_mean, etc.
+
+Step 14 – Expanded LOUO Tuning for 10 Users with FRR Limit
+Provided tune_louo_expanded.py with wide hyperparameter grid, FAR ≤ 0.5%, FRR ≤ 30%, using features/v2/ path.
+
+Ready to run on the current 10‑user dataset.
+
+Step 15 – Overfitting Check via Validation Split
+Added validate() method to SessionOCSVM (not yet integrated into main loop) to check overfitting using a hold‑out of genuine sessions.
+
+Step 16 – Review of Remaining Feature Enhancements
+Listed 8 potential additions (orientation, stroke geometry, richer aggregation, high‑frequency band, sample entropy, spectral coherence, per‑gesture stats, jerk smoothness).
+
+Provided implementation steps and expected TAR gains.
+
+Step 17 – Final Code Corrections
+Addressed remaining structural errors (indentation, variable typo e → s, duplicate methods, default key inconsistencies).
+
+Provided the corrected full feature_creation_session.py and train_session.py.
+
+Step 18 – Environment and Dependencies
+Enumerated required packages (numpy, pandas, scikit‑learn, xgboost, boruta, shap, etc.).
+
+Provided requirements.txt and installation instructions.
+
+Step 19 – Handoff Document Generation
+Initiated the creation of a complete multi‑part handoff document covering project overview, dataset, environment, full codebase, feature engineering, models, experiments, errors, decisions, TODO, and conversation history.
+
+Step 20 – Current Status
+All Phase 1‑3 scripts are finalised.
+
+Phase 5 / LOUO tuning script is ready to run on 10 users.
+
+Feature extraction class contains all new features (per‑axis FFT, MFCC, multitaper, swipe geometry).
+
+Next step: execute LOUO tuning, apply best hyperparameters, uncomment remaining features, and continue adding the planned enhancements.
+
+END OF PART 11
