@@ -1,0 +1,100 @@
+PART 6 : MODELS
+Model Name
+One‑Class Support Vector Machine (OCSVM) with RBF Kernel
+
+Architecture
+Type: One‑class classifier. Learns a decision boundary that encloses the genuine (normal) training samples. Any point outside the boundary is considered an outlier (fraud).
+
+Kernel: Radial Basis Function (RBF).
+K(x, y) = exp(-γ ||x - y||²)
+
+Per‑user models: One separate OCSVM is trained for each user, using only that user’s genuine sessions. This captures the individual behavioural signature.
+
+Input dimensionality: The feature set size after manual selection (via drop_cols) varies; currently around 100 features. After the full pipeline, the final feature set may be reduced.
+
+Output: A decision score s = decision_function(x). If s ≥ threshold, the session is classified as genuine; otherwise fraud.
+
+Hyperparameters
+Parameter	Meaning	Tuned Value (Current)	Search Range Used
+nu	Upper bound on fraction of training errors; lower bound on fraction of support vectors. Controls boundary tightness.	0.2	[0.001, 0.005, 0.01, 0.02, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5]
+gamma	Kernel coefficient. Determines influence of a single training sample.	0.00055	Fixed at 0.00055 plus adaptive multiples of 1/n_features (from 0.01× to 5×).
+threshold	Decision score cut‑off.	-0.3	[-0.5, -0.4, -0.3, -0.2, -0.1, 0.0, 0.1, 0.2, 0.3, 0.5]
+Note: The tuned values were obtained via the LOUO hyperparameter search on the 3‑user set. They are used in train_session.py and will be re‑tuned with more users.
+
+Training Procedure (per user)
+Data loading: SessionOCSVM.load_and_prepare_data() loads the user’s _training_sessions.csv and _testing_sessions.csv.
+
+Feature selection: Columns listed in the drop_cols list are excluded; all other numeric columns are used.
+
+Handling missing values: np.nan_to_num fills NaNs with 0 (in the base script; the Phase 1 and tuning scripts use median imputation for better statistical properties).
+
+Scaling: StandardScaler is fitted on the genuine training matrix (X_train) and then used to transform both training and test data.
+
+Model fitting: OneClassSVM(kernel='rbf', nu=nu, gamma=gamma) is fitted on the scaled training data.
+
+No validation split is used in the base training script; however, the validate() method (not integrated into the main loop) can perform a quick hold‑out check for overfitting by splitting the genuine training data into train/val and evaluating the FRR on the validation portion.
+
+Testing / Evaluation Procedure
+The test set (X_test) contains both genuine and impostor sessions.
+
+After scaling with the already‑fitted scaler, the model’s decision_function is called to get raw scores.
+
+Predictions: y_pred = 1 (genuine) if score ≥ threshold, else -1 (impostor).
+
+Metrics computed:
+
+FRR = fraction of genuine samples with score < threshold.
+
+FAR = fraction of impostor samples with score ≥ threshold.
+
+TAR = 1 – FRR.
+
+Accuracy = fraction of correct predictions.
+
+Hyperparameter Tuning Strategy
+Method: Leave‑One‑User‑Out (LOUO) cross‑validation.
+
+Training set for fold u: All genuine sessions of the other (N‑1) users.
+
+Test set for fold u: The held‑out user u’s full test set (genuine + impostor).
+
+Selection criteria: Maximise average TAR across folds while keeping average FAR ≤ 0.005 and average FRR ≤ 0.30.
+
+The script tune_louo_expanded.py implements this with a wide grid search (12 nu × 11 gamma × 10 threshold = 1320 combinations × 10 folds = ~13k OCSVM trainings). It saves the results to louo_tuning_expanded_results.csv and prints the best configuration.
+
+Validation Against Overfitting
+An additional method validate() (in SessionOCSVM) can be used to detect overfitting:
+
+It splits the genuine training data into 80% training / 20% validation.
+
+Trains a temporary OCSVM on the training part, evaluates the FRR on the validation part.
+
+If the validation FRR exceeds a threshold (e.g., 0.15), a warning is issued, suggesting the model might be overfitting.
+
+This is a diagnostic tool; it has not yet been routinely used in the main pipeline.
+
+Results (to date)
+Baseline (original features, default hyperparameters nu=0.05, gamma=0.00055, threshold=0): Accuracy ~69%, TAR ~68%, FAR very low (~0.15%).
+
+After manual feature selection and hyperparameter tuning (nu=0.2, threshold=-0.3): Accuracy and TAR improved, though exact numbers on the current 10‑user set are being measured. The earlier 3‑user test showed a TAR increase after fixing a hardcoded threshold.
+
+Goal: Achieve TAR ≥ 90% while keeping FAR ≤ 0.5% and FRR ≤ 30%.
+
+Model Saving
+Trained OCSVM models and scalers are saved using joblib in the models/ directory:
+
+{user_id}_ocsvm.pkl
+
+{user_id}_scaler.pkl
+
+These can be loaded later for inference without retraining.
+
+Notes
+No other model architectures (deep learning, ensemble) have been tested; the project strictly uses OCSVM due to its simplicity, interpretability, and suitability for one‑class problems.
+
+The RBF kernel was chosen because the data is not linearly separable in the original feature space.
+
+The per‑user modelling approach is standard for behavioural authentication where each user has a unique behavioural signature.
+
+END OF PART 6
+
