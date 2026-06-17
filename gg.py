@@ -1,32 +1,21 @@
-def _get_active_segments(self, signal, k=1.0):
+def _get_active_window_indices(self, signal, fs, percentile=30):
     """
-    Retain samples whose absolute deviation from the mean
-    exceeds (mean absolute value + k * standard deviation of absolute values).
-    This adaptively removes low‑energy noise while keeping genuine motion.
+    Returns list of start indices of windows that are above the variance threshold.
     """
-    signal = np.asarray(signal, dtype=np.float64)
-
-    if len(signal) < 10:
-        return signal
-
-    # Remove DC component
-    signal = signal - np.mean(signal)
-
-    # Work with absolute values
-    mag = np.abs(signal)
-
-    # Adaptive threshold
-    threshold = np.mean(mag) + k * np.std(mag)
-
-    # Safety: if threshold is extremely high (e.g., all values are nearly constant), fall back
-    if threshold >= np.max(mag) or np.std(mag) < 1e-10:
-        return signal
-
-    active_mask = mag >= threshold
-    active_signal = signal[active_mask]
-
-    # If too few samples survive, return the original to avoid losing all data
-    if len(active_signal) < 10:
-        return signal
-
-    return active_signal
+    window_size = int(2 * fs)
+    window_size = max(16, min(window_size, 64))
+    hop_size = window_size // 2
+    variances = []
+    indices = []
+    for i in range(0, len(signal) - window_size + 1, hop_size):
+        chunk = signal[i:i+window_size]
+        variances.append(np.var(chunk))
+        indices.append(i)
+    if len(variances) < 2:
+        return indices   # keep all if too few
+    var_thresh = np.percentile(variances, percentile)
+    active_indices = [indices[j] for j, v in enumerate(variances) if v >= var_thresh]
+    # safety: if fewer than 2 active windows, return all
+    if len(active_indices) < 2:
+        return indices
+    return active_indices
