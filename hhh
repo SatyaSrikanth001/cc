@@ -1,0 +1,5 @@
+Step Your code Potential failure
+Collect timestamps for s in sensors: timestamps.append(s.get('timestamp')) Unsorted timestamps can give negative intervals → wrong rate.
+Remove large gaps normal_intervals = intervals[intervals < 500] (ms) If the true rate is ~2 Hz, all intervals are discarded → fallback used. Also, the hard 500 ms cutoff may be too aggressive for devices with occasional slow polls.
+Central tendency median_interval_ms = np.median(normal_intervals) The median of remaining intervals may still be skewed if the sensor occasionally sends bursts of data with different timing (e.g., when the screen wakes up).
+Fallback return 20.0 20 Hz is an arbitrary default. If the real rate is 10 Hz or 50 Hz, features will be systematically wrong.
