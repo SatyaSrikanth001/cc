@@ -1,0 +1,50 @@
+def _estimate_sampling_rate(self, sensors, fallback=20.0):
+    """
+    Robust sampling rate estimation.
+    1. Sort timestamps.
+    2. Remove large gaps (sensor off).
+    3. Compute intervals, quantize, find the most common interval.
+    4. Validate the result.
+    """
+    # 1. Collect and sort timestamps
+    timestamps = []
+    for s in sensors:
+        ts = s.get('timestamp')
+        if ts is not None:
+            timestamps.append(ts)
+    if len(timestamps) < 5:
+        return fallback
+
+    timestamps = np.sort(timestamps)           # mandatory
+    intervals = np.diff(timestamps)            # in the same unit as timestamps (assumed ms)
+
+    # 2. Remove extremely large gaps (sensor restarts, screen off)
+    #    Keep intervals <= 2000 ms (2 seconds) – typical for continuous sensing
+    valid_intervals = intervals[intervals <= 2000]
+    if len(valid_intervals) < 3:
+        return fallback
+
+    # 3. Quantize intervals to nearest 5 ms to find the dominant rate
+    quantized = np.round(valid_intervals / 5.0) * 5.0
+
+    # 4. Find the most frequent quantized interval (mode)
+    values, counts = np.unique(quantized, return_counts=True)
+    dominant_interval = values[np.argmax(counts)]
+
+    # 5. Safety check: if the dominant interval is unreasonable, fallback
+    if dominant_interval <= 0:
+        return fallback
+
+    fs = 1000.0 / dominant_interval       # convert ms to Hz
+
+    # Allow a wider range than before, but still reject absurd values
+    if fs < 1 or fs > 200:
+        return fallback
+
+    # Optional: warn if the signal is highly irregular
+    # (you can log this for monitoring)
+    # cv = np.std(valid_intervals) / np.mean(valid_intervals)
+    # if cv > 0.5:
+    #     print(f"[WARN] Irregular sampling detected (CV={cv:.2f}). FFT features may be noisy.")
+
+    return fs
