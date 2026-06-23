@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-Enhanced analysis: find which features make impostors score above the threshold,
-for ALL users at once. Generates per‑user rankings and a global ranking.
+Enhanced analysis: find features that cause false acceptances (FAR)
+and false rejections (FRR) for each user, with global summaries.
 
-Usage: python analyze_all_users_v2.py [threshold]
-       If threshold is not given, 0.0 is used.
+Usage: python analyze_FAR_FRR.py [threshold]
 """
 
 import os, sys, warnings
@@ -14,7 +13,7 @@ import joblib
 
 from train_session import SessionOCSVM
 
-warnings.filterwarnings('ignore')
+warnings.filterwarnings("ignore")
 
 # ======================= CONFIGURATION =======================
 MODELS_DIR = "models"
@@ -22,89 +21,145 @@ FEATURES_DIR = "./features/v2"
 
 # List of all users – adjust to your actual users
 USER_LIST = [
-    'samanth', 'vinay', 'reddy123', 'harshit', 'Bhargav128',
-    'Nikitha18', 'Pranav', 'surya_mangam30', 'gunja', 'skyy',
-    'uday', 'visha117', 'tiwari', 'Pratik', 'amishp', 'Diana', 'sarya'
+    "reddy56", "Nikitha18", "Diana", "Avnish", "skyy",
+    "Pranav", "surya", "divya", "Saurabh", "srikanth",
+    "Samarth", "harshit"
 ]
 # =============================================================
 
 def load_user_artifacts(user_id):
     """
     Load the trained model, scaler, and the preprocessed data
-    exactly as used during training. No CSV re‑reading.
+    exactly as used during training.
     """
     model_path = os.path.join(MODELS_DIR, f"{user_id}_ocsvm.pkl")
     scaler_path = os.path.join(MODELS_DIR, f"{user_id}_scaler.pkl")
     if not os.path.exists(model_path) or not os.path.exists(scaler_path):
-        raise FileNotFoundError(f"Model or scaler missing for {user_id}.")
+        raise FileNotFoundError(f"Model or scaler missing for {user_id}")
 
     ocsvm = joblib.load(model_path)
     scaler = joblib.load(scaler_path)
 
     train_csv = os.path.join(FEATURES_DIR, f"{user_id}_training_sessions.csv")
-    test_csv  = os.path.join(FEATURES_DIR, f"{user_id}_testing_sessions.csv")
+    test_csv = os.path.join(FEATURES_DIR, f"{user_id}_testing_sessions.csv")
 
-    # Use the exact same loading logic as training – returns clean arrays & DataFrames
     session_model = SessionOCSVM(user_id)
     X_train_raw, X_test_raw, y_test, train_df_proc, test_df_proc = \
         session_model.load_and_prepare_data(train_csv, test_csv)
 
-    feature_cols = session_model.feature_columns
+    # Load the actual feature list used during training (saved separately)
+    features_path = os.path.join(MODELS_DIR, f"{user_id}_features.pkl")
+    feature_cols = joblib.load(features_path)
 
-    # train_df_proc already has only feature_cols and NaN filled (by nan_to_num)
-    # test_df_proc same
-    return ocsvm, scaler, train_df_proc, test_df_proc, y_test, feature_cols
+    print(f"[{user_id}] Loaded saved feature list: {len(feature_cols)} features")
+    print(f"[{user_id}] Scaler expects: {scaler.n_features_in_} features")
+
+    if len(feature_cols) != scaler.n_features_in_:
+        raise ValueError(
+            f"Feature mismatch for {user_id}: "
+            f"features.pkl has {len(feature_cols)}, scaler expects {scaler.n_features_in_}"
+        )
+
+    # Keep only the features the scaler expects, in the same order
+    train_features = train_df_proc[feature_cols].copy()
+    test_features = test_df_proc[feature_cols].copy()
+
+    # Ensure numeric and fill NaN
+    train_features = train_features.apply(pd.to_numeric, errors="coerce").fillna(0)
+    test_features = test_features.apply(pd.to_numeric, errors="coerce").fillna(0)
+
+    print(f"Feature count: {len(feature_cols)}")
+    print(f"Train features shape: {train_features.shape}")
+    print(f"Test features shape: {test_features.shape}")
+
+    return ocsvm, scaler, train_features, test_features, y_test, feature_cols
 
 
 def analyze_one_user(user_id, threshold):
-    """Return a DataFrame of features ranked by how similar impostors are to genuine."""
+    """
+    Return two DataFrames:
+      - far_df : features ranked by z_diff_FAR ascending (worst FAR first)
+      - frr_df : features ranked by z_diff_FRR descending (worst FRR first)
+    """
     try:
         ocsvm, scaler, train_df, test_df, y_test, feature_cols = load_user_artifacts(user_id)
     except Exception as e:
-        print(f"  Skipping {user_id}: {e}")
+        print(f"Skipping {user_id}: {e}")
         return None, None
 
-    # Scale the test data using the saved scaler (fitted on training data)
+    # Scale test data
     X_test = test_df.values.astype(float)
-    X_test_scaled = scaler.transform(X_test)
+    try:
+        X_test_scaled = scaler.transform(X_test)
+    except Exception as e:
+        print(f"Scaling failed for {user_id}: {e}")
+        print("Expected features:", scaler.n_features_in_)
+        print("Provided features:", X_test.shape[1])
+        return None, None
+
     scores = ocsvm.decision_function(X_test_scaled)
 
-    imp_mask = (y_test == -1)      # impostor
-    high_score_imp = imp_mask & (scores >= threshold)
+    imp_mask = (y_test == -1)
+    gen_mask = (y_test == 1)
 
-    print(f"  [{user_id}] impostors above threshold ({threshold}): "
-          f"{high_score_imp.sum()}/{imp_mask.sum()}")
+    # False Acceptances: impostors with score >= threshold
+    fa_mask = imp_mask & (scores >= threshold)
+    # False Rejections: genuine with score < threshold
+    fr_mask = gen_mask & (scores < threshold)
 
-    if high_score_imp.sum() == 0:
-        return pd.DataFrame(), 0   # empty DataFrame, zero high‑score count
+    print(f"[{user_id}] False Acceptances: {fa_mask.sum()}/{imp_mask.sum()}")
+    print(f"[{user_id}] False Rejections:  {fr_mask.sum()}/{gen_mask.sum()}")
 
-    # Genuine training statistics (on the original feature values)
+    # Genuine training statistics (on original feature values)
     gen_mean = train_df.mean()
     gen_std = train_df.std()
 
-    # High‑scoring impostor subset (original values)
-    imp_high = test_df.loc[high_score_imp]
-    imp_high_mean = imp_high.mean()
+    far_df = pd.DataFrame()
+    frr_df = pd.DataFrame()
 
-    # z‑diff: how many standard deviations the impostor mean is from the genuine mean
-    with np.errstate(divide='ignore', invalid='ignore'):
-        z_diff = (imp_high_mean - gen_mean).abs() / (gen_std + 1e-8)
-    z_diff = z_diff.replace(np.inf, np.nan).fillna(0)
+    # --- FAR analysis ---
+    if fa_mask.sum() > 0:
+        imp_high = test_df.loc[fa_mask]
+        imp_high_mean = imp_high.mean()
 
-    result = pd.DataFrame({
-        'feature': z_diff.index,
-        'z_diff': z_diff.values,
-        'impostor_high_mean': imp_high_mean.values,
-        'genuine_train_mean': gen_mean.values,
-        'genuine_train_std': gen_std.values
-    }).sort_values('z_diff')
+        with np.errstate(divide="ignore", invalid="ignore"):
+            z_diff_far = (imp_high_mean - gen_mean).abs() / (gen_std + 1e-8)
+        z_diff_far = z_diff_far.replace(np.inf, np.nan).fillna(0)
 
-    result['rank'] = range(1, len(result) + 1)
-    return result, high_score_imp.sum()
+        far_df = pd.DataFrame({
+            "feature": z_diff_far.index,
+            "z_diff_FAR": z_diff_far.values,
+            "impostor_high_mean": imp_high_mean.values,
+            "genuine_train_mean": gen_mean.values,
+            "genuine_train_std": gen_std.values
+        }).sort_values("z_diff_FAR", ascending=True)  # smallest = most similar
+
+        far_df["rank_FAR"] = range(1, len(far_df) + 1)
+
+    # --- FRR analysis ---
+    if fr_mask.sum() > 0:
+        gen_low = test_df.loc[fr_mask]
+        gen_low_mean = gen_low.mean()
+
+        with np.errstate(divide="ignore", invalid="ignore"):
+            z_diff_frr = (gen_low_mean - gen_mean).abs() / (gen_std + 1e-8)
+        z_diff_frr = z_diff_frr.replace(np.inf, np.nan).fillna(0)
+
+        frr_df = pd.DataFrame({
+            "feature": z_diff_frr.index,
+            "z_diff_FRR": z_diff_frr.values,
+            "genuine_low_mean": gen_low_mean.values,
+            "genuine_train_mean": gen_mean.values,
+            "genuine_train_std": gen_std.values
+        }).sort_values("z_diff_FRR", ascending=False)  # largest = most different
+
+        frr_df["rank_FRR"] = range(1, len(frr_df) + 1)
+
+    return far_df, frr_df
 
 
 def main():
-    # Allow threshold from command line
+    # --- Threshold ---
     if len(sys.argv) > 1:
         try:
             THRESHOLD = float(sys.argv[1])
@@ -115,83 +170,109 @@ def main():
         THRESHOLD = 0.0
     print(f"Using decision threshold: {THRESHOLD}\n")
 
-    all_user_rankings = {}        # user_id -> DataFrame (all features ranked)
-    global_z_sums = {}            # sum of z_diff per feature across users
-    global_z_counts = {}          # count of users having this feature
-    global_z_medians = {}         # list of z_diff per feature for median/IQR
-    z_diff_lists = {}             # to store all z_diff values per feature
+    # --- Per‑user analysis ---
+    all_far_dfs = {}      # user -> DataFrame
+    all_frr_dfs = {}
     user_count = 0
 
     for user in USER_LIST:
-        rank_df, num_high = analyze_one_user(user, THRESHOLD)
-        if rank_df is None:
-            continue
-        if rank_df.empty:
-            # Perfect user – still contribute to counts? No, they have no impostor issues.
+        far_df, frr_df = analyze_one_user(user, THRESHOLD)
+        if far_df is None:
             continue
         user_count += 1
-        all_user_rankings[user] = rank_df
 
-        # Save per‑user CSV
-        rank_df.to_csv(f"feature_similarity_{user}.csv", index=False)
-
-        # Accumulate for global statistics
-        for _, row in rank_df.iterrows():
-            feat = row['feature']
-            z = row['z_diff']
-            if feat not in z_diff_lists:
-                z_diff_lists[feat] = []
-            z_diff_lists[feat].append(z)
+        if not far_df.empty:
+            all_far_dfs[user] = far_df
+            far_df.to_csv(f"FAR_features_{user}.csv", index=False)
+        if not frr_df.empty:
+            all_frr_dfs[user] = frr_df
+            frr_df.to_csv(f"FRR_features_{user}.csv", index=False)
 
     if user_count == 0:
-        print("No users with valid data found.")
+        print("No users with valid data.")
         return
 
-    # Build global DataFrame
-    global_rows = []
-    for feat, z_list in z_diff_lists.items():
-        avg_z = np.mean(z_list)
-        med_z = np.median(z_list)
-        iqr_z = np.percentile(z_list, 75) - np.percentile(z_list, 25)
-        # critical count: users where z_diff < 1.0 (impostors very close to genuine)
-        critical = sum(1 for z in z_list if z < 1.0)
-        global_rows.append({
-            'feature': feat,
-            'avg_z_diff': avg_z,
-            'median_z_diff': med_z,
-            'iqr_z_diff': iqr_z,
-            'critical_count': critical,          # #users where feature is very weak
-            'total_users': len(z_list)
+    # ================== Global FAR aggregation ==================
+    z_far_lists = {}      # feature -> list of z_diff_FAR across users
+    far_top20_counts = {}
+
+    for user, df in all_far_dfs.items():
+        for _, row in df.iterrows():
+            feat = row["feature"]
+            z = row["z_diff_FAR"]
+            if feat not in z_far_lists:
+                z_far_lists[feat] = []
+            z_far_lists[feat].append(z)
+
+        top20 = set(df.head(20)["feature"])
+        for feat in top20:
+            far_top20_counts[feat] = far_top20_counts.get(feat, 0) + 1
+
+    global_far_rows = []
+    for feat, zlist in z_far_lists.items():
+        avg_z = np.mean(zlist)
+        med_z = np.median(zlist)
+        iqr_z = np.percentile(zlist, 75) - np.percentile(zlist, 25)
+        critical = sum(1 for z in zlist if z < 1.0)   # impostor very close
+        global_far_rows.append({
+            "feature": feat,
+            "avg_z_diff_FAR": avg_z,
+            "median_z_diff_FAR": med_z,
+            "iqr_z_diff_FAR": iqr_z,
+            "critical_count_FAR": critical,
+            "total_users": len(zlist),
+            "top20_count_FAR": far_top20_counts.get(feat, 0)
         })
 
-    global_rank_df = pd.DataFrame(global_rows)
-    global_rank_df.sort_values('avg_z_diff', inplace=True)
+    far_global_df = pd.DataFrame(global_far_rows).sort_values("avg_z_diff_FAR")
+    far_global_df.to_csv("FAR_features_global.csv", index=False)
 
-    # Top‑20 count (features most often in a user's personal top‑20)
-    top20_counts = {}
-    for user, df in all_user_rankings.items():
-        top20 = set(df.head(20)['feature'])
+    # ================== Global FRR aggregation ==================
+    z_frr_lists = {}      # feature -> list of z_diff_FRR across users
+    frr_top20_counts = {}
+
+    for user, df in all_frr_dfs.items():
+        for _, row in df.iterrows():
+            feat = row["feature"]
+            z = row["z_diff_FRR"]
+            if feat not in z_frr_lists:
+                z_frr_lists[feat] = []
+            z_frr_lists[feat].append(z)
+
+        top20 = set(df.head(20)["feature"])
         for feat in top20:
-            top20_counts[feat] = top20_counts.get(feat, 0) + 1
-    global_rank_df['top20_count'] = global_rank_df['feature'].map(top20_counts).fillna(0).astype(int)
+            frr_top20_counts[feat] = frr_top20_counts.get(feat, 0) + 1
 
-    # Save global summary
-    global_rank_df.to_csv("feature_similarity_global.csv", index=False)
+    global_frr_rows = []
+    for feat, zlist in z_frr_lists.items():
+        avg_z = np.mean(zlist)
+        med_z = np.median(zlist)
+        iqr_z = np.percentile(zlist, 75) - np.percentile(zlist, 25)
+        critical = sum(1 for z in zlist if z > 2.0)   # genuine far from normal
+        global_frr_rows.append({
+            "feature": feat,
+            "avg_z_diff_FRR": avg_z,
+            "median_z_diff_FRR": med_z,
+            "iqr_z_diff_FRR": iqr_z,
+            "critical_count_FRR": critical,
+            "total_users": len(zlist),
+            "top20_count_FRR": frr_top20_counts.get(feat, 0)
+        })
 
-    # Print summaries
-    print("\n=== GLOBAL TOP 20 PROBLEMATIC FEATURES (lowest avg z‑diff) ===")
-    print(global_rank_df.head(20).to_string(index=False))
+    frr_global_df = pd.DataFrame(global_frr_rows).sort_values("avg_z_diff_FRR", ascending=False)
+    frr_global_df.to_csv("FRR_features_global.csv", index=False)
 
-    print("\n=== FEATURES WITH HIGHEST 'CRITICAL COUNT' (z‑diff < 1.0) ===")
-    critical_sorted = global_rank_df.sort_values('critical_count', ascending=False)
-    print(critical_sorted.head(20).to_string(index=False))
+    # --- Print summaries ---
+    print("\n=== GLOBAL TOP 20 FAR‑DRIVING FEATURES (lowest avg z‑diff) ===")
+    print(far_global_df.head(20).to_string(index=False))
 
-    print("\n=== FEATURES MOST OFTEN IN USER TOP‑20 ===")
-    top20_global = global_rank_df.sort_values('top20_count', ascending=False)
-    print(top20_global.head(20).to_string(index=False))
+    print("\n=== GLOBAL TOP 20 FRR‑DRIVING FEATURES (highest avg z‑diff) ===")
+    print(frr_global_df.head(20).to_string(index=False))
 
-    print("\nPer‑user files saved as feature_similarity_<user>.csv")
-    print("Global file saved as feature_similarity_global.csv")
+    print("\nPer‑user FAR files: FAR_features_<user>.csv")
+    print("Per‑user FRR files: FRR_features_<user>.csv")
+    print("Global FAR file: FAR_features_global.csv")
+    print("Global FRR file: FRR_features_global.csv")
 
 
 if __name__ == "__main__":
