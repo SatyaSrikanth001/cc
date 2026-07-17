@@ -62,7 +62,25 @@ s2) now study the situation how to make features useful and find features work i
 q1)if a set of features work will there how they might disturb other sometimes ?
  like this divide the entire data set try doing different thing for each set 
 
+11)100% Sure Fixed things for a feature
+1)the feature should help us separating genuine in poster 
+2)The features should also make a good margin with between the genuine and imposter
+3)Very good if will have diverse features because each of them capture different things
+4)
 
+
+Like 
+Decision tree with each node a decision or a rule example rules 
+number one ) a feature that is able to rank good score 
+number two) feature that is able to rank good the genuine and feature being able to rank correctly the imposter separately each and
+ 
+third one) is combined feature doing both things 
+
+Fourth one) feature giving correctly for both imposter and genuine and now we consider the margin how much margin
+
+Fifth one) Like is the feature diverse or coming from already decided or finalized existing sensor set
+
+Sixth one)
 
 Todo:
 1.not all modules using only the module 4 try for eah module one run 
