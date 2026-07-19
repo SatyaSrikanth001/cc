@@ -1,0 +1,54 @@
+data:
+  features_dir: "synthetic_features"
+  id_columns:
+    - "session_id"
+    - "device_owner_id"
+  feature_prefix: ""
+
+cleaning:
+  missing_threshold: 0.3            # drop features with >30% missing (computed on DEV only)
+  constant_user_threshold: 0.8      # drop features constant in >80% of users (DEV only)
+
+split:
+  dev_ratio: 0.8                    # fraction of each user's TESTING sessions used for dev
+  random_state: 42                  # single seed for the whole pipeline
+
+# Phase 2A – Noise Purge
+noise_purge:
+  noise_threshold: 0.52
+
+# Phase 2B – Elite Ranking
+top_k: 100
+
+# Phase 3 – mRMR
+final_k: 40
+
+# Phase 4 – Consensus
+consensus:
+  weights:
+    our_phase2b: 2
+    fisher: 1
+    mutual_info: 1
+    relieff: 1
+    laplacian: 1
+
+# Phase 5 – OCSVM validation
+ocsvm:
+  kernel: "rbf"
+  nu: 0.1
+  gamma: "scale"
+
+output:
+  dir: "out"
+  split_manifest: "out/split_manifest.csv"
+  filtered_features: "out/phase2a_survivors.csv"
+  auc_details: "out/phase2a_auc_details.csv"
+  elite_features: "out/phase2b_top100_features.csv"
+  behavioral_ranking: "out/phase2b_ranking.csv"
+  final_features: "out/phase3_final_40_features.csv"
+  mrmr_scores: "out/phase3_mrmr_scores.csv"
+  consensus_ranking: "out/phase4_consensus_ranking.csv"
+  final_selected_features: "out/phase4_final_selected_features.csv"
+  eer_results: "out/phase5_eer_results.csv"
+  validation_boxplot: "out/phase5_validation_boxplots.png"
+  summary_metrics: "out/phase5_summary_metrics.csv"
