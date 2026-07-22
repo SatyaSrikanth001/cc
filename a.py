@@ -1,178 +1,367 @@
 #!/usr/bin/env python3
 """
-Exhaustive LOUO Hyper‑Parameter Search for OCSVM
-Targets: max FAR = 0, avg FRR ≤ 0.20, threshold = 0.
-If a solution exists, it will be found.
-Otherwise, reports limiting users and suggests next actions.
+Deep Per‑User Feature Audit with Rich Metrics and Visual Flags
+---------------------------------------------------------------
+For each user, computes a comprehensive set of metrics per feature,
+flags problematic ones with red emojis 🔴, explains why, and saves
+separate CSVs for healthy and problematic features.
 """
 
-import os, glob, warnings
-import pandas as pd
+import os, sys, json, glob, warnings
 import numpy as np
-from sklearn.svm import OneClassSVM
-from sklearn.preprocessing import StandardScaler
-from joblib import Parallel, delayed
-import time
-
-from train_session import SessionOCSVM
+import pandas as pd
+from scipy.stats import (
+    skew, kurtosis, mannwhitneyu, spearmanr, iqr
+)
+import logging
 
 warnings.filterwarnings("ignore")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 # ======================= CONFIGURATION =======================
-DATA_DIR = "./features/v2"
-TRAIN_PATTERN = "*_training_sessions.csv"
-TEST_PATTERN  = "*_testing_sessions.csv"
+CONFIG = {
+    "USER_LIST": [
+        'srikanth', 'Samarth', 'harshit', 'avinash', 'deepika',
+        'kavya', 'manoj', 'nandini', 'pranay', 'rajesh',
+        'sneha', 'varun', 'vijay', 'yash', 'zara'
+    ],
+    "FEATURES_DIR": "./features/new_app",
+    "SELECTED_FEATURES_JSON": "selected_features.json",
 
-N_JOBS = -1
+    # Thresholds for flagging
+    "MISSING_PCT": 10.0,
+    "CONSTANT_PCT": 95.0,
+    "CV_THRESHOLD": 2.0,
+    "SKEW_THRESHOLD": 3.0,
+    "KURTOSIS_THRESHOLD": 8.0,
+    "MODZ_THRESHOLD": 3.5,
+    "OUTLIER_FRACTION_THRESHOLD": 0.1,
+    "ABSOLUTE_EXTREME": 1e9,
+    "NEAR_ZERO_STD": 1e-10,
+    "TEMPORAL_DRIFT_PVAL": 0.01,
+    "TRAIN_TEST_SHIFT_PVAL": 0.01,
+    "BIMODALITY_COEFF_THRESH": 0.55,
+    "DUPLICATE_PCT": 70.0,
+    "MAD_RATIO_THRESH": 2.0,
+    "IQR_RATIO_THRESH": 3.0,
+    "SPREAD_RATIO_THRESH": 1e6,
+}
 
-# Extremely wide and dense grids
-NU_VALUES = np.round(np.arange(0.001, 0.51, 0.01), 3).tolist()   # 0.001, 0.011, ..., 0.501
-FIXED_GAMMA = 0.00055
-# Adaptive multipliers + extra logarithmic range
-GAMMA_MULTIPLIERS = [0.001, 0.005, 0.01, 0.05, 0.1, 0.2, 0.3, 0.5, 0.7, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0, 20.0]
+OUTPUT_DIR = "audit_reports"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-THRESHOLD = 0.0
-TARGET_MAX_FAR = 0.0
-TARGET_AVG_FRR = 0.20
 # =============================================================
 
-# 1. Users and data
-train_files = sorted(glob.glob(os.path.join(DATA_DIR, TRAIN_PATTERN)))
-all_users = [os.path.basename(f).replace("_training_sessions.csv", "") for f in train_files]
-print(f"Users: {all_users}")
+def load_selected_features(json_path):
+    with open(json_path, 'r') as f:
+        features = json.load(f)
+    if not isinstance(features, list):
+        raise ValueError("selected_features.json must contain a JSON list of feature names")
+    logging.info(f"Loaded {len(features)} features to audit.")
+    return features
 
-user_data = {}
-feature_counts = []
-for user in all_users:
-    train_path = os.path.join(DATA_DIR, f"{user}_training_sessions.csv")
-    test_path  = os.path.join(DATA_DIR, f"{user}_testing_sessions.csv")
-    model = SessionOCSVM(user)
-    X_train, X_test, y_test, _, _ = model.load_and_prepare_data(train_path, test_path)
-    user_data[user] = {"X_train": X_train, "X_test": X_test, "y_test": y_test}
-    feature_counts.append(X_train.shape[1])
-assert len(set(feature_counts)) == 1, "Feature count mismatch!"
-n_features = feature_counts[0]
+def load_user_sessions(user, feat_list):
+    train_path = os.path.join(CONFIG["FEATURES_DIR"], f"{user}_training_sessions.csv")
+    test_path  = os.path.join(CONFIG["FEATURES_DIR"], f"{user}_testing_sessions.csv")
+    dfs = []
+    for path, label in [(train_path, 'train'), (test_path, 'test')]:
+        if not os.path.exists(path):
+            logging.warning(f"Missing {path} for user {user}")
+            continue
+        df = pd.read_csv(path)
+        available = [f for f in feat_list if f in df.columns]
+        if not available:
+            continue
+        df = df[available + (['session_id'] if 'session_id' in df.columns else [])]
+        if 'session_id' not in df.columns:
+            df['session_id'] = [f"{label}_{i}" for i in range(len(df))]
+        else:
+            df['session_id'] = df['session_id'].astype(str)
+        df['_source'] = label
+        dfs.append(df)
+    if not dfs:
+        return None, []
+    combined = pd.concat(dfs, ignore_index=True)
+    for f in available:
+        combined[f] = pd.to_numeric(combined[f], errors='coerce')
+    return combined, available
 
-# 2. Gamma candidates
-gamma_candidates = [FIXED_GAMMA] + [mult / n_features for mult in GAMMA_MULTIPLIERS]
-gamma_candidates = sorted(set(gamma_candidates))
-print(f"Gamma values: {len(gamma_candidates)}")
-print(f"Total combinations: {len(NU_VALUES) * len(gamma_candidates)}")
+def compute_all_metrics(series, session_ids, source_labels, session_order):
+    """Return a dictionary of all computed metrics and a list of issue descriptions."""
+    x = series.values.astype(float)
+    n = len(x)
+    nan_mask = np.isnan(x)
+    n_missing = nan_mask.sum()
+    clean = x[~nan_mask]
+    n_clean = len(clean)
 
-# 3. Evaluation function
-def evaluate_combination(nu, gamma):
-    user_fars, user_frrs, user_tars = [], [], []
-    for user in all_users:
-        X_train = user_data[user]["X_train"]
-        X_test  = user_data[user]["X_test"]
-        y_test  = user_data[user]["y_test"]
+    metrics = {
+        'n_total': n,
+        'n_missing': n_missing,
+        'missing_pct': 100.0 * n_missing / n if n > 0 else 100.0,
+        'n_clean': n_clean,
+        'mean': np.nan,
+        'std': np.nan,
+        'min': np.nan,
+        'max': np.nan,
+        'median': np.nan,
+        'mad': np.nan,
+        'iqr': np.nan,
+        'p01': np.nan,
+        'p05': np.nan,
+        'p95': np.nan,
+        'p99': np.nan,
+        'skew': np.nan,
+        'kurtosis': np.nan,
+        'cv': np.nan,
+        'outlier_fraction': np.nan,
+        'max_abs_modz': np.nan,
+        'temporal_corr': np.nan,
+        'temporal_pval': np.nan,
+        'train_test_shift_pval': np.nan,
+        'bimodality_coeff': np.nan,
+        'duplicate_pct': np.nan,
+        'mad_ratio': np.nan,
+        'iqr_ratio': np.nan,
+        'spread_ratio': np.nan,
+    }
 
-        scaler = StandardScaler()
-        X_train_scaled = scaler.fit_transform(X_train)
-        X_test_scaled  = scaler.transform(X_test)
+    reasons = []   # list of strings explaining problems
+    flagged_metrics = set()  # set of metric keys that are flagged
 
-        ocsvm = OneClassSVM(kernel="rbf", nu=nu, gamma=gamma)
-        ocsvm.fit(X_train_scaled)
+    if n_clean == 0:
+        metrics['all_missing'] = True
+        reasons.append("All values missing")
+        flagged_metrics.add('missing_pct')
+        return metrics, reasons, flagged_metrics
 
-        scores = ocsvm.decision_function(X_test_scaled)
-        pred_genuine = scores >= THRESHOLD
+    # Basic stats
+    clean_vals = clean[~np.isnan(clean)]  # just in case
+    if len(clean_vals) == 0:
+        return metrics, reasons, flagged_metrics
 
-        is_genuine  = y_test == 1
-        is_impostor = y_test == -1
+    mean_v = np.mean(clean_vals)
+    std_v = np.std(clean_vals, ddof=1)
+    med = np.median(clean_vals)
+    mad = np.median(np.abs(clean_vals - med)) if len(clean_vals) > 1 else 0.0
+    iqr_val = iqr(clean_vals)
+    p01, p05, p95, p99 = np.percentile(clean_vals, [1,5,95,99])
+    sk = skew(clean_vals)
+    kurt = kurtosis(clean_vals)  # excess
+    cv = abs(std_v / mean_v) if mean_v != 0 else (np.inf if std_v > 0 else 0.0)
 
-        far = pred_genuine[is_impostor].mean() if is_impostor.sum() > 0 else 0.0
-        frr = 1.0 - pred_genuine[is_genuine].mean() if is_genuine.sum() > 0 else 0.0
-        tar = 1.0 - frr
-
-        user_fars.append(far)
-        user_frrs.append(frr)
-        user_tars.append(tar)
-
-    avg_tar = np.mean(user_tars)
-    max_far = max(user_fars)
-    avg_frr = np.mean(user_frrs)
-    return (nu, gamma, avg_tar, max_far, avg_frr, user_fars, user_frrs)
-
-# 4. Run search
-param_combinations = [(nu, g) for nu in NU_VALUES for g in gamma_candidates]
-start = time.time()
-results = Parallel(n_jobs=N_JOBS, verbose=10)(
-    delayed(evaluate_combination)(nu, g) for nu, g in param_combinations
-)
-print(f"Search finished in {(time.time()-start)/60:.1f} min")
-
-# 5. Find best constrained solution
-best_constrained = None
-best_constrained_tar = -1
-
-# Fallback: among those with max FAR = 0, pick lowest avg FRR (then highest TAR)
-# Actually, we want max FAR=0 and avg FRR <=0.2
-for nu, gamma, avg_tar, max_far, avg_frr, user_fars, user_frrs in results:
-    if max_far == TARGET_MAX_FAR and avg_frr <= TARGET_AVG_FRR:
-        if avg_tar > best_constrained_tar:
-            best_constrained_tar = avg_tar
-            best_constrained = (nu, gamma, avg_tar, max_far, avg_frr, user_fars, user_frrs)
-
-# 6. Output
-print("\n" + "="*60)
-if best_constrained:
-    nu_b, gamma_b, avg_tar_b, max_far_b, avg_frr_b, user_fars_b, user_frrs_b = best_constrained
-    print("✅ SOLUTION FOUND meeting max FAR=0 and avg FRR≤0.20")
-    print(f"   nu={nu_b}, gamma={gamma_b:.6f}, threshold=0")
-    print(f"   Avg TAR={avg_tar_b:.4f}, Avg FRR={avg_frr_b:.4f}, Max FAR={max_far_b:.4f}")
-    per_user_df = pd.DataFrame({
-        "user": all_users,
-        "TAR": [1-frr for frr in user_frrs_b],
-        "FRR": user_frrs_b,
-        "FAR": user_fars_b
+    metrics.update({
+        'mean': mean_v,
+        'std': std_v,
+        'min': np.min(clean_vals),
+        'max': np.max(clean_vals),
+        'median': med,
+        'mad': mad,
+        'iqr': iqr_val,
+        'p01': p01, 'p05': p05, 'p95': p95, 'p99': p99,
+        'skew': sk, 'kurtosis': kurt,
+        'cv': cv,
     })
-    per_user_df.to_csv("best_louo_per_user.csv", index=False)
-    print("   Per‑user metrics saved to best_louo_per_user.csv")
-else:
-    print("❌ NO COMBINATION SATISFIES BOTH CONSTRAINTS.")
-    # Find combination with max FAR=0 and smallest possible avg FRR (even if >0.2)
-    best_maxfar_zero = None
-    best_maxfar_zero_frr = 1.0
-    for nu, gamma, avg_tar, max_far, avg_frr, user_fars, user_frrs in results:
-        if max_far == 0.0 and avg_frr < best_maxfar_zero_frr:
-            best_maxfar_zero_frr = avg_frr
-            best_maxfar_zero = (nu, gamma, avg_tar, max_far, avg_frr, user_fars, user_frrs)
-    if best_maxfar_zero:
-        nu0, gamma0, _, _, avg_frr0, user_fars0, user_frrs0 = best_maxfar_zero
-        print(f"\nBest with FAR=0: nu={nu0}, gamma={gamma0:.6f}, avg FRR={avg_frr0:.4f} (exceeds 0.20)")
-        # Identify users with highest FRR
-        frr_series = pd.Series(user_frrs0, index=all_users)
-        worst = frr_series.nlargest(5)
-        print("Users with highest FRR (>=0.2):")
-        for u, frr in worst.items():
-            if frr >= 0.2:
-                print(f"  {u}: FRR={frr:.4f}, TAR={1-frr:.4f}")
+
+    # Missing check
+    if (100.0 * n_missing / n) > CONFIG["MISSING_PCT"]:
+        reasons.append(f"High missing ({metrics['missing_pct']:.1f}%)")
+        flagged_metrics.add('missing_pct')
+
+    # Inf check
+    inf_mask = np.isinf(clean_vals)
+    n_inf = inf_mask.sum()
+    if n_inf > 0:
+        reasons.append(f"{n_inf} Inf values")
+        flagged_metrics.add('n_clean')  # placeholder
+
+    # Constant / near‑constant
+    if std_v < CONFIG["NEAR_ZERO_STD"]:
+        reasons.append("Constant (zero variance)")
+        flagged_metrics.add('std')
     else:
-        # No combination even gives max FAR=0
-        print("No combination even achieves max FAR=0. The following users have FAR>0 in the best case:")
-        # Find combination with smallest max FAR
-        min_max_far = 1.0
-        best_min_far = None
-        for r in results:
-            if r[3] < min_max_far:
-                min_max_far = r[3]
-                best_min_far = r
-        if best_min_far:
-            nu_m, gamma_m, avg_tar_m, max_far_m, avg_frr_m, user_fars_m, user_frrs_m = best_min_far
-            print(f"Best achievable max FAR = {max_far_m:.4f} with nu={nu_m}, gamma={gamma_m:.6f}")
-            far_series = pd.Series(user_fars_m, index=all_users)
-            print("Users with FAR > 0:")
-            for u, far in far_series[far_series > 0].items():
-                print(f"  {u}: FAR={far:.4f}")
+        most_common_pct = 100.0 * pd.Series(clean_vals).value_counts().iloc[0] / n_clean
+        if most_common_pct >= CONFIG["CONSTANT_PCT"]:
+            reasons.append(f"Near‑constant ({most_common_pct:.1f}% identical)")
+            flagged_metrics.add('duplicate_pct')
 
-    print("\nTo meet the targets, you may need to:")
-    print(" - Improve features (remove features that cause these users' impostors to score high)")
-    print(" - Allow per‑user nu/gamma tuning (same features)")
-    print(" - Slightly lower the threshold (currently 0)")
+    # Extreme values
+    extreme_mask = np.abs(clean_vals) > CONFIG["ABSOLUTE_EXTREME"]
+    n_extreme = extreme_mask.sum()
+    if n_extreme > 0:
+        ext_sessions = [session_ids[i] for i in np.where(extreme_mask)[0]][:5]
+        reasons.append(f"{n_extreme} extreme values (sessions: {', '.join(ext_sessions)})")
+        flagged_metrics.add('max')
+        flagged_metrics.add('min')
 
-# Save full results
-full_df = pd.DataFrame(
-    [(nu, gamma, avg_tar, max_far, avg_frr) for nu, gamma, avg_tar, max_far, avg_frr, _, _ in results],
-    columns=["nu", "gamma", "avg_TAR", "max_FAR", "avg_FRR"]
-)
-full_df.to_csv("louo_tuning_full_results.csv", index=False)
+    # High dispersion
+    if cv > CONFIG["CV_THRESHOLD"]:
+        reasons.append(f"High CV ({cv:.2f})")
+        flagged_metrics.add('cv')
+    if med != 0 and mad > 0:
+        mad_ratio = mad / abs(med)
+        iqr_ratio = iqr_val / abs(med)
+        metrics['mad_ratio'] = mad_ratio
+        metrics['iqr_ratio'] = iqr_ratio
+        if mad_ratio > CONFIG["MAD_RATIO_THRESH"]:
+            reasons.append(f"High MAD/median ({mad_ratio:.2f})")
+            flagged_metrics.add('mad_ratio')
+        if iqr_ratio > CONFIG["IQR_RATIO_THRESH"]:
+            reasons.append(f"High IQR/median ({iqr_ratio:.2f})")
+            flagged_metrics.add('iqr_ratio')
+    spread = (p99 - p01) / (abs(med) + 1e-8)
+    metrics['spread_ratio'] = spread
+    if spread > CONFIG["SPREAD_RATIO_THRESH"]:
+        reasons.append(f"Extreme spread ({spread:.2e})")
+        flagged_metrics.add('spread_ratio')
+
+    # Outliers
+    if n_clean > 3 and mad > 0:
+        mod_z = 0.6745 * (clean_vals - med) / mad
+        outlier_mask = np.abs(mod_z) > CONFIG["MODZ_THRESHOLD"]
+        n_out = outlier_mask.sum()
+        outlier_frac = n_out / n_clean
+        metrics['outlier_fraction'] = outlier_frac
+        metrics['max_abs_modz'] = np.max(np.abs(mod_z))
+        if outlier_frac > CONFIG["OUTLIER_FRACTION_THRESHOLD"]:
+            out_sessions = [session_ids[i] for i in np.where(outlier_mask)[0]][:10]
+            reasons.append(f"Many outliers ({outlier_frac:.1%}, sessions: {', '.join(out_sessions)})")
+            flagged_metrics.add('outlier_fraction')
+        elif np.max(np.abs(mod_z)) > 5.0:
+            out_sessions = [session_ids[i] for i in np.where(outlier_mask)[0]][:5]
+            reasons.append(f"Extreme outlier (max modZ={np.max(np.abs(mod_z)):.1f}, sessions: {', '.join(out_sessions)})")
+            flagged_metrics.add('max_abs_modz')
+
+    # Distribution shape
+    if abs(sk) > CONFIG["SKEW_THRESHOLD"]:
+        reasons.append(f"High skewness ({sk:.2f})")
+        flagged_metrics.add('skew')
+    if kurt > CONFIG["KURTOSIS_THRESHOLD"]:
+        reasons.append(f"High kurtosis ({kurt:.2f})")
+        flagged_metrics.add('kurtosis')
+    if n_clean > 3:
+        bc = (sk**2 + 1) / (kurt + 3) if (kurt + 3) != 0 else 0
+        metrics['bimodality_coeff'] = bc
+        if bc > CONFIG["BIMODALITY_COEFF_THRESH"]:
+            reasons.append(f"Bimodal (BC={bc:.2f})")
+            flagged_metrics.add('bimodality_coeff')
+
+    # Temporal drift
+    if session_order is not None and n_clean > 10:
+        mask = ~np.isnan(series)
+        corr, pval = spearmanr(session_order[mask], series[mask])
+        metrics['temporal_corr'] = corr
+        metrics['temporal_pval'] = pval
+        if pval < CONFIG["TEMPORAL_DRIFT_PVAL"] and abs(corr) > 0.3:
+            reasons.append(f"Temporal drift (r={corr:.2f}, p={pval:.4f})")
+            flagged_metrics.add('temporal_pval')
+
+    # Train‑test shift
+    train_mask = (np.array(source_labels) == 'train')[~nan_mask]
+    test_mask = (np.array(source_labels) == 'test')[~nan_mask]
+    if train_mask.sum() > 3 and test_mask.sum() > 3:
+        try:
+            _, pval = mannwhitneyu(clean_vals[train_mask], clean_vals[test_mask], alternative='two-sided')
+            metrics['train_test_shift_pval'] = pval
+            if pval < CONFIG["TRAIN_TEST_SHIFT_PVAL"]:
+                reasons.append(f"Train‑test shift (p={pval:.4f})")
+                flagged_metrics.add('train_test_shift_pval')
+        except:
+            pass
+
+    # Duplicate dominance (quantization)
+    dup_pct = 100.0 * pd.Series(clean_vals).value_counts().iloc[0] / n_clean
+    metrics['duplicate_pct'] = dup_pct
+    if dup_pct > CONFIG["DUPLICATE_PCT"]:
+        reasons.append(f"Quantized ({dup_pct:.1f}% duplicates)")
+        flagged_metrics.add('duplicate_pct')
+
+    return metrics, reasons, flagged_metrics
+
+def format_metrics_for_csv(metrics, flagged_metrics):
+    """Return a copy of metrics with 🔴 appended to flagged metric values."""
+    formatted = {}
+    for key, val in metrics.items():
+        if key in flagged_metrics and val is not None and not isinstance(val, bool):
+            # Convert to string with red emoji
+            formatted[key] = f"{val} 🔴"
+        else:
+            formatted[key] = val
+    return formatted
+
+def audit_user(user, features):
+    sessions_df, available = load_user_sessions(user, features)
+    if sessions_df is None:
+        logging.info(f"  {user}: no data found")
+        return None, [], []
+
+    session_ids = sessions_df['session_id'].tolist()
+    source_labels = sessions_df['_source'].tolist()
+    if 'session_order' in sessions_df.columns:
+        session_order = sessions_df['session_order'].values
+    else:
+        session_order = np.arange(len(sessions_df))
+
+    problematic_rows = []
+    healthy_rows = []
+    global_issue_counts = {}
+
+    for feat in available:
+        feat_series = sessions_df[feat]
+        metrics, reasons, flagged = compute_all_metrics(feat_series, session_ids, source_labels, session_order)
+        # Determine if problematic
+        is_problematic = len(reasons) > 0
+        reason_str = "; ".join(reasons) if reasons else ""
+
+        # Prepare row: feature name + formatted metrics + reason
+        row = {'feature': feat, 'is_problematic': is_problematic, 'reason': reason_str}
+        formatted_metrics = format_metrics_for_csv(metrics, flagged)
+        row.update(formatted_metrics)
+
+        if is_problematic:
+            problematic_rows.append(row)
+            global_issue_counts[feat] = global_issue_counts.get(feat, 0) + 1
+        else:
+            healthy_rows.append(row)
+
+    # Save separate CSVs
+    if problematic_rows:
+        df_prob = pd.DataFrame(problematic_rows)
+        df_prob.to_csv(os.path.join(OUTPUT_DIR, f"audit_{user}_problematic.csv"), index=False)
+    if healthy_rows:
+        df_health = pd.DataFrame(healthy_rows)
+        df_health.to_csv(os.path.join(OUTPUT_DIR, f"audit_{user}_healthy.csv"), index=False)
+
+    num_prob = len(problematic_rows)
+    num_health = len(healthy_rows)
+    logging.info(f"  {user}: {num_prob} problematic, {num_health} healthy features")
+    return global_issue_counts, num_prob, num_health
+
+def main():
+    logging.info("Starting deep per‑user feature audit with enhanced output...")
+    features = load_selected_features(CONFIG["SELECTED_FEATURES_JSON"])
+    if not features:
+        logging.error("No features loaded.")
+        return
+
+    all_global_counts = {}
+    for user in CONFIG["USER_LIST"]:
+        user_counts, _, _ = audit_user(user, features)
+        if user_counts:
+            for feat, cnt in user_counts.items():
+                all_global_counts[feat] = all_global_counts.get(feat, 0) + cnt
+
+    if all_global_counts:
+        summary_df = pd.DataFrame(
+            [{'feature': f, 'n_users_affected': cnt} for f, cnt in all_global_counts.items()]
+        ).sort_values('n_users_affected', ascending=False)
+        summary_path = os.path.join(OUTPUT_DIR, "global_audit_summary.csv")
+        summary_df.to_csv(summary_path, index=False)
+        logging.info(f"Global summary saved to {summary_path}")
+        print("\n=== Top problematic features (most users affected) ===")
+        print(summary_df.head(20).to_string(index=False))
+    else:
+        logging.info("No issues found across all users – excellent data quality!")
+
+if __name__ == "__main__":
+    main()
