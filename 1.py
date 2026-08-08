@@ -8,7 +8,12 @@ Shift to another app and comeback now we are seeing 2 keyboards both custom and 
 
 4.remove the thing saying typing username like this text
 
-5.match these dimensions for the keys on the keyboard
+5.and when we press back button earlier when we are using keyboard the keyboard used to collapse(become invisible or gone)
+now upon pressing back button it is going to previous page instead
+
+6.for the numeric keypad keep this very simple numeric keypad and have 
+
+7.match these dimensions for the keys on the keyboard
 
 I compared the key geometry directly from both screenshots.
 Dimensions to change
